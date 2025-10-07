@@ -23,6 +23,22 @@ import pandas as pd
 import gradio as gr
 from dataclasses import dataclass
 from typing import Tuple, Dict
+
+
+# Work around gradio 4.44.0 schema bug where additionalProperties can be boolean.
+try:
+    from gradio_client import utils as grc_utils
+
+    _ORIG_JSON_SCHEMA_TO_PYTHON_TYPE = grc_utils._json_schema_to_python_type
+
+    def _safe_json_schema_to_python_type(schema, defs=None):
+        if isinstance(schema, bool):
+            return "Any" if schema else "Never"
+        return _ORIG_JSON_SCHEMA_TO_PYTHON_TYPE(schema, defs)
+
+    grc_utils._json_schema_to_python_type = _safe_json_schema_to_python_type
+except (ImportError, AttributeError):
+    pass
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
@@ -108,7 +124,8 @@ def plot_pr_curve(pr_curve: Tuple[np.ndarray, np.ndarray, np.ndarray], ap: float
     plt.savefig(buf, format="png", dpi=144)
     plt.close()
     buf.seek(0)
-    return buf.getvalue()
+    # Convert saved image bytes to a numpy array so the gr.Image output receives the expected type
+    return plt.imread(buf, format="png")
 
 
 def select_candidates(df: pd.DataFrame, model: Pipeline, budget: int, epsilon: float, seed: int = 7) -> pd.DataFrame:
@@ -171,7 +188,7 @@ def ui_train(file, test_size, budget, epsilon, seed):
     try:
         df = load_csv(file)
         res = train_model(df, test_size=test_size, random_state=seed)
-        pr_png = plot_pr_curve(res.pr_curve, res.ap)
+        pr_img = plot_pr_curve(res.pr_curve, res.ap)
 
         # default budget if None
         if budget <= 0:
@@ -192,7 +209,7 @@ def ui_train(file, test_size, budget, epsilon, seed):
             f"Top columns: {', '.join(res.feature_names[:6])}..."
         )
 
-        return summary, pr_png, sel_show, imp_show
+        return summary, pr_img, sel_show, imp_show
     except Exception as e:
         return f"Error: {e}", None, None, None
 
@@ -240,4 +257,3 @@ def build_app():
 if __name__ == "__main__":
     app = build_app()
     app.launch()
-
