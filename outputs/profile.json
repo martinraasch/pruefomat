@@ -1,0 +1,48 @@
+{
+  "input_excel": "data/Veri-Bsp.xlsx",
+  "sheet": 0,
+  "column_mapping": {
+    "Land": "Land",
+    "Zahlbetr.": "Zahlbetr",
+    "BUK": "BUK",
+    "Belegart": "Belegart",
+    "DEB Name ": "DEB_Name",
+    "Rechnungsnummer": "Rechnungsnummer",
+    "Belegdatum": "Belegdatum",
+    "Betrag": "Betrag",
+    "F\u00e4llig": "Fallig",
+    "Debitor": "Debitor",
+    "Ampel": "Ampel",
+    "Ma\u00dfnahme\n2025": "Manahme_2025",
+    "MA DRM": "MA_DRM",
+    "Datum": "Datum",
+    "Tage": "Tage",
+    "Hinweise": "Hinweise",
+    "R\u00fccklauf ": "Rucklauf",
+    "WV": "WV",
+    "Ticket-\nnummer": "Ticket_nummer",
+    "R\u00fcckmeldung erhalten": "Ruckmeldung_erhalten",
+    "negativ": "negativ"
+  },
+  "feature_plan": {
+    "numeric": [
+      "Betrag_parsed"
+    ],
+    "categorical": [
+      "Land",
+      "BUK",
+      "Debitor"
+    ],
+    "text": [
+      "DEB_Name",
+      "Hinweise"
+    ]
+  },
+  "dropped_columns": [
+    "Tage",
+    "WV",
+    "Ticket_nummer"
+  ],
+  "baseline_model": "outputs/model.joblib",
+  "metrics_file": "outputs/metrics.json"
+}

@@ -1,37 +1,38 @@
-"""
-Fraud-Selector Prototype v0.1
----------------------------------
-A minimal end-to-end demo for selecting review candidates with a controllable
-randomness (epsilon) using the Credit Card Fraud dataset schema.
+"""Gradio interface for the pruefomat Veri pipeline builder."""
 
-Run locally:
-  pip install gradio pandas scikit-learn matplotlib numpy
-  python app.py
+import json
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-Then open the local URL printed in the console.
-
-Notes:
-- Works with the common Kaggle/UCI credit card fraud CSV (columns: Time, V1..V28, Amount, Class)
-- Explanations here are limited to feature importances since V1..V28 are PCA components.
-- Later, swap the feature engineering + column names to your invoice schema with minimal changes.
-"""
-
-import io
-import os
+import gradio as gr
+import joblib
 import numpy as np
 import pandas as pd
-import gradio as gr
-from dataclasses import dataclass
-from typing import Tuple, Dict
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import balanced_accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 
+from build_pipeline_veri import (
+    DataFramePreparer,
+    DaysUntilDueAdder,
+    FeaturePlan,
+    build_preprocessor,
+    infer_feature_plan,
+    normalize_column_name,
+    normalize_columns,
+)
 
-# Work around gradio 4.44.0 schema bug where additionalProperties can be boolean.
+# ---------------------------------------------------------------------------
+# Gradio schema monkey-patch (4.44.0 bug fix)
+# ---------------------------------------------------------------------------
 try:
     from gradio_client import utils as grc_utils
 
     _ORIG_JSON_SCHEMA_TO_PYTHON_TYPE = grc_utils._json_schema_to_python_type
 
-    def _safe_json_schema_to_python_type(schema, defs=None):
+    def _safe_json_schema_to_python_type(schema, defs=None):  # type: ignore[override]
         if isinstance(schema, bool):
             return "Any" if schema else "Never"
         return _ORIG_JSON_SCHEMA_TO_PYTHON_TYPE(schema, defs)
@@ -39,221 +40,285 @@ try:
     grc_utils._json_schema_to_python_type = _safe_json_schema_to_python_type
 except (ImportError, AttributeError):
     pass
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import precision_recall_curve, average_precision_score
-from sklearn.metrics import precision_score, recall_score
-import matplotlib.pyplot as plt
 
-@dataclass
-class TrainResult:
-    model: Pipeline
-    ap: float
-    pr_curve: Tuple[np.ndarray, np.ndarray, np.ndarray]
-    threshold_at_k: float
-    feature_names: list
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def load_csv(file_obj) -> pd.DataFrame:
-    if isinstance(file_obj, str):
-        df = pd.read_csv(file_obj)
+def _parse_sheet(sheet_text: str) -> int | str:
+    text = (sheet_text or "").strip()
+    return int(text) if text.isdigit() else text or 0
+
+
+def _format_schema(df: pd.DataFrame) -> Dict[str, Any]:
+    details = []
+    total_rows = len(df)
+    for col in df.columns:
+        non_null = int(df[col].notna().sum())
+        details.append(
+            {
+                "column": col,
+                "dtype": str(df[col].dtype),
+                "non_null": non_null,
+                "null_pct": float(100 * (1 - non_null / total_rows)) if total_rows else 0.0,
+            }
+        )
+    return {"rows": total_rows, "columns": len(df.columns), "fields": details}
+
+
+def _reset_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("preprocessor", "feature_plan", "prep_path", "baseline_model", "baseline_path", "metrics_path"):
+        state.pop(key, None)
+    return state
+
+
+def load_dataset(upload, sheet_text: str, target_text: str, state: Optional[Dict[str, Any]]):
+    state = state or {}
+    if upload is None:
+        return "Bitte zuerst eine Excel-Datei hochladen.", None, None, state
+
+    sheet = _parse_sheet(sheet_text)
+    try:
+        df_raw = pd.read_excel(upload.name, sheet_name=sheet, dtype="object")
+    except Exception as exc:  # pragma: no cover
+        return f"Fehler beim Laden: {exc}", None, None, state
+
+    df_norm, column_mapping = normalize_columns(df_raw)
+
+    target_norm = normalize_column_name(target_text) if target_text else None
+    target_series = None
+    df_features = df_norm
+    target_msg = "Keine Zielspalte gesetzt."
+    if target_norm and target_norm in df_norm.columns:
+        target_series = df_norm[target_norm]
+        df_features = df_norm.drop(columns=[target_norm])
+        target_msg = f"Zielspalte erkannt: {target_norm}"
+    elif target_norm:
+        target_msg = f"Warnung: '{target_text}' (normalisiert '{target_norm}') nicht gefunden."
+
+    state.update(
+        {
+            "excel_path": upload.name,
+            "sheet": sheet,
+            "column_mapping": column_mapping,
+            "df_features": df_features,
+            "target": target_series,
+            "target_name": target_norm,
+        }
+    )
+    state = _reset_pipeline_state(state)
+
+    preview = df_norm.head(8)
+    schema = _format_schema(df_norm)
+    schema["column_mapping"] = column_mapping
+
+    status = f"Geladen: {Path(upload.name).name} (Sheet {sheet}) | {len(df_norm)} Zeilen, {df_norm.shape[1]} Spalten. {target_msg}"
+    return status, preview, schema, state
+
+
+def build_pipeline_action(state: Optional[Dict[str, Any]]):
+    state = state or {}
+    df_features = state.get("df_features")
+    if df_features is None or df_features.empty:
+        return "Keine Daten geladen.", None, None, state
+
+    preparer_preview = DataFramePreparer(amount_col="Betrag", issue_col="Belegdatum", due_col="Faellig", date_columns=["Datum"])
+    prepared = preparer_preview.fit_transform(df_features)
+    with_due = DaysUntilDueAdder(issue_col="Belegdatum", due_col="Faellig").fit_transform(prepared)
+
+    feature_plan = infer_feature_plan(with_due)
+    if not feature_plan.numeric and not feature_plan.categorical and not feature_plan.text:
+        return "Keine nutzbaren Features gefunden.", None, None, state
+
+    preprocessor = build_preprocessor(feature_plan)
+    preprocessor.fit(df_features)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_prep_"))
+    prep_path = tmp_dir / "prep_pipeline.joblib"
+    joblib.dump(preprocessor, prep_path)
+
+    state.update(
+        {
+            "preprocessor": preprocessor,
+            "feature_plan": feature_plan,
+            "prep_path": str(prep_path),
+        }
+    )
+
+    plan_json = {
+        "numeric": feature_plan.numeric,
+        "categorical": feature_plan.categorical,
+        "text": feature_plan.text,
+        "dropped": getattr(preprocessor.named_steps["prep_df"], "columns_to_drop_", []),
+    }
+
+    return "Preprocessor trainiert und gespeichert.", plan_json, str(prep_path), state
+
+
+def preview_features_action(state: Optional[Dict[str, Any]], sample_size: int = 10):
+    state = state or {}
+    df_features = state.get("df_features")
+    preprocessor = state.get("preprocessor")
+    if df_features is None or preprocessor is None:
+        return "Bitte zuerst Pipeline bauen.", None
+
+    sample = df_features.head(sample_size)
+    matrix = preprocessor.transform(sample)
+    encoder = preprocessor.named_steps["encode"]
+    feature_names = list(encoder.get_feature_names_out())
+    if not feature_names:
+        return "Keine transformierten Merkmale vorhanden.", None
+
+    keep = min(10, len(feature_names))
+    if hasattr(matrix, "toarray"):
+        arr = matrix[:, :keep].toarray()
     else:
-        # gradio provides tempfile-like objects
-        df = pd.read_csv(file_obj.name)
-    # Basic sanity: expected columns present
-    expected_last = {"Amount", "Class"}
-    if not expected_last.issubset(set(df.columns)):
-        raise ValueError("CSV must include 'Amount' and 'Class' columns (plus V1..V28 and Time).")
-    return df
+        arr = np.asarray(matrix)[:, :keep]
+    preview_df = pd.DataFrame(arr, columns=feature_names[:keep])
+    return f"Vorschau fuer {len(sample)} Zeilen (erste {keep} Features).", preview_df
 
 
-def split_xy(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    X = df.drop(columns=["Class"])  # use all other cols as features
-    y = df["Class"].astype(int)
-    return X, y
+def train_baseline_action(state: Optional[Dict[str, Any]]):
+    state = state or {}
+    df_features = state.get("df_features")
+    target = state.get("target")
+    feature_plan: FeaturePlan | None = state.get("feature_plan")
 
+    if df_features is None or feature_plan is None:
+        return "Bitte zuerst Pipeline bauen.", None, None, None, None, state
+    if target is None:
+        return "Keine Zielspalte verfuegbar.", None, None, None, None, state
 
-def train_model(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 42) -> TrainResult:
-    X, y = split_xy(df)
+    baseline = Pipeline(
+        steps=[
+            ("preprocessor", build_preprocessor(feature_plan)),
+            (
+                "classifier",
+                RandomForestClassifier(
+                    n_estimators=300,
+                    random_state=42,
+                    n_jobs=-1,
+                    class_weight="balanced",
+                ),
+            ),
+        ]
+    )
 
-    # time-based split could be used; for simplicity we use stratified random split here
+    stratify = target if target.dropna().nunique() > 1 else None
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state, stratify=y
+        df_features,
+        target,
+        test_size=0.2,
+        random_state=42,
+        stratify=stratify,
     )
 
-    # Pipeline: scale -> logistic regression -> calibration (isotonic)
-    base = Pipeline([
-        ("scaler", StandardScaler(with_mean=False)),  # sparse-safe
-        ("logreg", LogisticRegression(max_iter=200, class_weight="balanced")),
-    ])
-    clf = CalibratedClassifierCV(base, method="isotonic", cv=3)
+    baseline.fit(X_train, y_train)
+    y_pred = baseline.predict(X_test)
 
-    clf.fit(X_train, y_train)
+    metrics = {
+        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+        "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
+        "classification_report": classification_report(y_test, y_pred, zero_division=0),
+    }
+    confusion = confusion_matrix(y_test, y_pred)
+    confusion_df = pd.DataFrame(confusion)
 
-    # Evaluate AP (PR-AUC)
-    proba = clf.predict_proba(X_test)[:, 1]
-    ap = float(average_precision_score(y_test, proba))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_model_"))
+    model_path = tmp_dir / "baseline_model.joblib"
+    metrics_path = tmp_dir / "metrics.json"
+    joblib.dump(baseline, model_path)
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    precision, recall, thresholds = precision_recall_curve(y_test, proba)
-
-    # Pick a default K ~= 2% of test set as plausible daily review budget proportion
-    k_ratio = 0.02
-    k = max(1, int(len(y_test) * k_ratio))
-
-    # threshold at top-k
-    topk_idx = np.argsort(proba)[::-1][:k]
-    thr_at_k = float(sorted(proba, reverse=True)[k-1])
-
-    return TrainResult(model=clf, ap=ap, pr_curve=(precision, recall, thresholds),
-                       threshold_at_k=thr_at_k, feature_names=list(X.columns))
-
-
-def plot_pr_curve(pr_curve: Tuple[np.ndarray, np.ndarray, np.ndarray], ap: float) -> np.ndarray:
-    precision, recall, _ = pr_curve
-    plt.figure(figsize=(5,4))
-    plt.step(recall, precision, where="post")
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title(f"PR Curve (AP={ap:.3f})")
-    plt.grid(True, alpha=0.3)
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=144)
-    plt.close()
-    buf.seek(0)
-    # Convert saved image bytes to a numpy array so the gr.Image output receives the expected type
-    return plt.imread(buf, format="png")
-
-
-def select_candidates(df: pd.DataFrame, model: Pipeline, budget: int, epsilon: float, seed: int = 7) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    X, y = split_xy(df)
-    scores = model.predict_proba(X)[:, 1]
-    df_out = df.copy()
-    df_out["score"] = scores
-
-    # Deterministic top part
-    n_top = max(0, int(round(budget * (1 - epsilon))))
-    n_rand = max(0, budget - n_top)
-
-    # Get top-n by score
-    top_idx = np.argsort(scores)[::-1][:n_top]
-
-    # Random exploration among the remainder
-    remaining_idx = np.setdiff1d(np.arange(len(df_out)), top_idx)
-    rand_idx = rng.choice(remaining_idx, size=min(n_rand, len(remaining_idx)), replace=False)
-
-    chosen = np.concatenate([top_idx, rand_idx])
-    selection = df_out.iloc[chosen].copy()
-
-    # Log propensity: simple mixture model prop (not exact but indicative)
-    base_prop = epsilon * (1.0 / max(1, len(remaining_idx)))
-    selection["propensity"] = np.where(
-        selection.index.isin(top_idx),
-        (1 - epsilon),
-        base_prop,
+    state.update(
+        {
+            "baseline_model": baseline,
+            "baseline_path": str(model_path),
+            "metrics_path": str(metrics_path),
+        }
     )
 
-    # Nice ordering: top first, then random by score
-    selection.sort_values(by=["score"], ascending=False, inplace=True)
-
-    # Keep a compact view
-    cols = [c for c in df.columns if c not in ("Class",)] + ["score", "propensity", "Class"]
-    return selection[cols]
+    return "Baseline trainiert.", metrics, confusion_df, str(model_path), str(metrics_path), state
 
 
-def quick_importance(df: pd.DataFrame, model: Pipeline, n: int = 10) -> pd.DataFrame:
-    # fallback: use absolute LR coefficients after scaling, if available
-    try:
-        # Drill down to calibrated -> base pipeline -> logreg
-        base = model.base_estimator
-        logreg = base.named_steps["logreg"]
-        scaler = base.named_steps["scaler"]
-        coefs = np.abs(logreg.coef_[0])
-        names = df.drop(columns=["Class"]).columns
-        imp = pd.DataFrame({"feature": names, "importance": coefs})
-        imp.sort_values("importance", ascending=False, inplace=True)
-        return imp.head(n)
-    except Exception:
-        names = df.drop(columns=["Class"]).columns
-        return pd.DataFrame({"feature": names[:n], "importance": np.nan})
+# ---------------------------------------------------------------------------
+# Gradio UI
+# ---------------------------------------------------------------------------
 
 
-# ---- Gradio UI ----
-
-def ui_train(file, test_size, budget, epsilon, seed):
-    try:
-        df = load_csv(file)
-        res = train_model(df, test_size=test_size, random_state=seed)
-        pr_img = plot_pr_curve(res.pr_curve, res.ap)
-
-        # default budget if None
-        if budget <= 0:
-            budget = max(1, int(len(df) * 0.02))
-        sel = select_candidates(df, res.model, budget=budget, epsilon=epsilon, seed=seed)
-
-        # importance
-        imp = quick_importance(df, res.model, n=12)
-
-        # Render tables as TSV strings (Gradio DataFrames sometimes truncate)
-        sel_show = sel.head(min(50, len(sel))).to_csv(sep='\t', index=False)
-        imp_show = imp.to_csv(sep='\t', index=False)
-
-        summary = (
-            f"AP (PR-AUC): {res.ap:.4f}\n"
-            f"Threshold@~2% Top-K: {res.threshold_at_k:.6f}\n"
-            f"Selected (budget): {len(sel)} rows | epsilon={epsilon:.2f} (random share)\n"
-            f"Top columns: {', '.join(res.feature_names[:6])}..."
+def build_interface() -> gr.Blocks:
+    with gr.Blocks(title="pruefomat") as demo:
+        gr.Markdown(
+            """
+            # pruefomat – Fraud/Veri-Selector
+            1. Excel laden und Schema pruefen.
+            2. Pipeline bauen (Preprocessing + Feature-Encoding).
+            3. Optional Baseline trainieren und Ergebnisse inspizieren.
+            """
         )
 
-        return summary, pr_img, sel_show, imp_show
-    except Exception as e:
-        return f"Error: {e}", None, None, None
-
-
-def build_app():
-    with gr.Blocks(title="Fraud-Selector v0.1") as demo:
-        gr.Markdown("""
-        # Fraud-Selector v0.1
-        Minimaler Prototyp: trainiert ein kalibriertes LogReg-Modell auf dem Credit-Card-Fraud-Datensatz
-        und wählt eine **Arbeitsliste** aus mit *Budget* und *Zufallsanteil (epsilon)*.
-        
-        **Hinweis:** V1..V28 sind PCA-Komponenten. Erklärungen zeigen Feature-Importanzen innerhalb dieser Komponenten.
-        Später werden hier eure Rechnungs-Features angezeigt.
-        """)
+        state = gr.State({})
 
         with gr.Row():
-            file = gr.File(label="CSV hochladen (creditcard.csv)")
-        with gr.Row():
-            test_size = gr.Slider(0.1, 0.5, value=0.2, step=0.05, label="Testanteil")
-            budget = gr.Number(value=500, precision=0, label="Prüf-Budget (Zeilen)")
-            epsilon = gr.Slider(0.0, 0.5, value=0.10, step=0.01, label="Zufallsanteil ε")
-            seed = gr.Number(value=42, precision=0, label="Seed")
+            file_input = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+            sheet_input = gr.Textbox(value="0", label="Sheet (Index oder Name)")
+            target_input = gr.Textbox(value="Ampel", label="Zielspalte (optional)")
+            load_btn = gr.Button("Daten laden")
 
-        run_btn = gr.Button("Trainieren & Auswahl erzeugen")
+        load_status = gr.Textbox(label="Status", interactive=False)
+        data_preview = gr.Dataframe(label="Daten (erste Zeilen)", interactive=False)
+        schema_json = gr.JSON(label="Schema / Mapping")
 
-        summary = gr.Textbox(label="Zusammenfassung", lines=5)
-        pr_plot = gr.Image(label="PR-Kurve", type="numpy")
-        sel_tbl = gr.Textbox(label="Auswahl (Top 50, TSV)", lines=20)
-        imp_tbl = gr.Textbox(label="Feature-Importanz (Top 12, TSV)", lines=12)
+        gr.Markdown("## Pipeline")
+        build_btn = gr.Button("Pipeline bauen")
+        build_status = gr.Textbox(label="Pipeline-Status", interactive=False)
+        plan_json = gr.JSON(label="Feature-Plan")
+        prep_download = gr.File(label="Preprocessor Download", interactive=False)
 
-        run_btn.click(ui_train, inputs=[file, test_size, budget, epsilon, seed], outputs=[summary, pr_plot, sel_tbl, imp_tbl])
+        preview_btn = gr.Button("Features Vorschau")
+        preview_status = gr.Textbox(label="Preview-Status", interactive=False)
+        preview_table = gr.Dataframe(label="Transformierte Features", interactive=False)
 
-        gr.Markdown("""
-        ## Erklärung
-        - **Budget**: Anzahl der täglich zu prüfenden Zeilen.
-        - **ε (epsilon)**: Zufallsanteil der Auswahl (Exploration). 0.1 = 10% Random.
-        - **AP (PR-AUC)**: geeignete Metrik bei starken Klassenungleichgewichten.
-        - **Threshold@~2%**: Score-Schwelle der Top-2% im Testsplit (Heuristik für Startbudget).
-        
-        > Nächste Iteration: Off-Policy-Evaluation (IPS/DR), SHAP-Visualisierungen, Schema-Adapter für Rechnungsdaten.
-        """)
+        gr.Markdown("## Baseline Modell")
+        baseline_btn = gr.Button("Baseline trainieren")
+        baseline_status = gr.Textbox(label="Baseline-Status", interactive=False)
+        metrics_json = gr.JSON(label="Metriken")
+        confusion_df = gr.Dataframe(label="Confusion Matrix", interactive=False)
+        model_download = gr.File(label="Baseline Modell", interactive=False)
+        metrics_download = gr.File(label="Metrics JSON", interactive=False)
+
+        load_btn.click(
+            load_dataset,
+            inputs=[file_input, sheet_input, target_input, state],
+            outputs=[load_status, data_preview, schema_json, state],
+        )
+
+        build_btn.click(
+            build_pipeline_action,
+            inputs=[state],
+            outputs=[build_status, plan_json, prep_download, state],
+        )
+
+        preview_btn.click(
+            preview_features_action,
+            inputs=[state],
+            outputs=[preview_status, preview_table],
+        )
+
+        baseline_btn.click(
+            train_baseline_action,
+            inputs=[state],
+            outputs=[baseline_status, metrics_json, confusion_df, model_download, metrics_download, state],
+        )
+
     return demo
 
 
+def main():
+    demo = build_interface()
+    demo.launch()
+
+
 if __name__ == "__main__":
-    app = build_app()
-    app.launch()
+    main()

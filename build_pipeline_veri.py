@@ -1,354 +1,489 @@
 #!/usr/bin/env python3
-# build_pipeline_veri.py
-# Usage-Beispiele:
-#   Nur Preprocessing (ohne Ampel):
-#     python build_pipeline_veri.py --excel Veri-Bsp.xlsx --sheet 0
-#   Mit Training auf Zielspalte "Ampel":
-#     python build_pipeline_veri.py --excel Veri-Bsp.xlsx --sheet 0 --target Ampel
-#   Mit lokalen Text-Embeddings statt TF-IDF:
-#     python build_pipeline_veri.py --excel Veri-Bsp.xlsx --sheet 0 --target Ampel --use-embeddings
+"""Build preprocessing pipeline and optional baseline model for Veri data."""
 
-import argparse, re, sys
+import argparse
+import json
+import re
+import sys
+import unicodedata
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional, Sequence
 
+import joblib
 import numpy as np
 import pandas as pd
-
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.utils.validation import check_is_fitted
-import joblib
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (balanced_accuracy_score, classification_report,
+                             confusion_matrix, f1_score)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-# ----------------------
-# Hilfsfunktionen
-# ----------------------
+# =============================================================================
+# Helper functions
+# =============================================================================
 
-GERMAN_MONEY_PATTERN = re.compile(r"[.\s]")
+NULL_LIKE_DEFAULT = {"", " ", "-", "_", "n/a", "na", "nan", "None"}
 
-def to_numeric_series(s: pd.Series) -> pd.Series:
-    """Konvertiert robust Beträge: ' 43,914.51 ' oder '43.914,51' -> float."""
-    ss = s.astype(str).str.strip()
-    # de: Komma als Dezimaltrenner
-    de_mask = ss.str.contains(r",\d{1,2}$")
-    ss_de = ss[de_mask].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    # en/sonst: entferne Tausendertrennzeichen/Leerzeichen
-    ss_en = ss[~de_mask].str.replace(GERMAN_MONEY_PATTERN, "", regex=True)
-    merged = pd.concat([ss_de, ss_en]).reindex(s.index)
-    return pd.to_numeric(merged, errors="coerce")
 
-def to_datetime_series(s: pd.Series) -> pd.Series:
-    """Konvertiert robust Datumsangaben inkl. '-', 'diverse' -> NaT."""
-    x = s.astype(str).str.strip().replace({"-": np.nan, "diverse": np.nan, "": np.nan})
-    # erst dayfirst=True versuchen, dann False
-    for dayfirst in (True, False):
-        dt = pd.to_datetime(x, errors="coerce", dayfirst=dayfirst, infer_datetime_format=True)
-        if dt.notna().mean() > 0.6:
-            return dt
-    return pd.to_datetime(x, errors="coerce", dayfirst=True)
+def to_str(values: Iterable) -> pd.Series:
+    """Return values as pandas Series of strings."""
+    return pd.Series(list(values), dtype="string").fillna("")
 
-def normalize_colname(c):
-    c = str(c).strip().replace("\n", " ")
-    c = c.replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss")
-    c = re.sub(r"\s+", "_", c)
-    c = re.sub(r"[^A-Za-z0-9_]", "", c)
-    return c
 
-# ----------------------
-# Custom Transformer
-# ----------------------
+def strip_lower(series: pd.Series) -> pd.Series:
+    """Strip whitespace and lowercase string entries while keeping missing as NaN."""
+    s = series.astype("string").str.strip()
+    s = s.replace({"": pd.NA})
+    return s.str.lower()
 
-class DateFeatureExtractor(BaseEstimator, TransformerMixin):
-    """Erzeugt Datumsfeatures und tage_bis_faellig aus Belegdatum/Faellig."""
-    def __init__(self, beleg_col: Optional[str], faellig_col: Optional[str], date_cols: List[str]):
-        self.beleg_col = beleg_col
-        self.faellig_col = faellig_col
-        self.date_cols = date_cols or []
 
-    def fit(self, X, y=None):
-        df = pd.DataFrame(X)
-        self.out_cols_ = []
-        for c in self.date_cols:
-            if c in df.columns:
-                self.out_cols_ += [f"{c}_year", f"{c}_month", f"{c}_weekday", f"{c}_is_month_end"]
-        if self.beleg_col and self.faellig_col:
-            self.out_cols_ += ["tage_bis_faellig"]
+def normalize_column_name(name: str) -> str:
+    """Convert column name to snake_case ASCII for stable references."""
+    text = unicodedata.normalize("NFKD", str(name))
+    text = text.encode("ascii", "ignore").decode("ascii")
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", "_", text.strip())
+    text = re.sub(r"[^0-9A-Za-z_]+", "", text)
+    return text
+
+
+def parse_date_series(series: pd.Series, dayfirst: bool = True) -> pd.Series:
+    """Parse date strings using pandas with heuristic dayfirst handling."""
+    text = series.astype("string").str.strip()
+    text = text.replace({"": pd.NA, "-": pd.NA})
+
+    options = [dayfirst, not dayfirst] if dayfirst in (True, False) else [True, False]
+    best = None
+    best_valid = -1
+    for flag in options:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            parsed = pd.to_datetime(text, errors="coerce", dayfirst=flag)
+        valid = int(parsed.notna().sum())
+        if valid > best_valid:
+            best_valid = valid
+            best = parsed
+        if valid == len(text):
+            break
+    if best is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            best = pd.to_datetime(text, errors="coerce")
+    return best
+
+
+def safe_amount(series: pd.Series) -> pd.Series:
+    """Parse localized amount strings into floats."""
+    s = series.astype("string").str.replace(r"\s", "", regex=True)
+    s = s.str.replace(r"\.(?=\d{3}(\D|$))", "", regex=True)
+    s = s.str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def days_until_due(issue: pd.Series, due: pd.Series) -> pd.Series:
+    """Compute days between issue and due dates."""
+    return (due - issue).dt.days
+
+
+def ensure_directory(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# Custom transformers
+# =============================================================================
+
+
+class DataFramePreparer(BaseEstimator, TransformerMixin):
+    """Normalize raw Veri dataframe: clean strings, parse amounts and dates."""
+
+    def __init__(
+        self,
+        amount_col: str = "Betrag",
+        issue_col: str = "Belegdatum",
+        due_col: str = "Faellig",
+        date_columns: Optional[Sequence[str]] = None,
+        null_like: Optional[Sequence[str]] = None,
+    ) -> None:
+        self.amount_col = amount_col
+        self.issue_col = issue_col
+        self.due_col = due_col
+        self.date_columns = list(date_columns) if date_columns is not None else []
+        self.null_like = set(null_like) if null_like is not None else set(NULL_LIKE_DEFAULT)
+
+    def fit(self, X, y=None):  # noqa: D401
+        df = self._prepare_dataframe(pd.DataFrame(X).copy())
+        self.columns_to_drop_ = [col for col in df.columns if df[col].isna().all()]
+        self.feature_names_in_ = list(df.columns)
+        self.feature_names_out_ = [c for c in df.columns if c not in self.columns_to_drop_]
         return self
 
     def transform(self, X):
-        check_is_fitted(self, "out_cols_")
-        df = pd.DataFrame(X).copy()
-        out = pd.DataFrame(index=df.index)
+        df = self._prepare_dataframe(pd.DataFrame(X).copy())
+        for col in getattr(self, "columns_to_drop_", []):
+            if col in df.columns:
+                df = df.drop(columns=[col])
+        return df
 
-        for c in self.date_cols:
-            if c not in df.columns: 
-                continue
-            dt = to_datetime_series(df[c])
-            out[f"{c}_year"] = dt.dt.year
-            out[f"{c}_month"] = dt.dt.month
-            out[f"{c}_weekday"] = dt.dt.weekday
-            out[f"{c}_is_month_end"] = dt.dt.is_month_end.astype(float)
+    def _prepare_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        replacements = {val: np.nan for val in self.null_like}
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            df = df.replace(replacements)
+        df = df.infer_objects(copy=False)
 
-        if self.beleg_col and self.faellig_col:
-            due = to_datetime_series(df[self.faellig_col])
-            iss = to_datetime_series(df[self.beleg_col])
-            out["tage_bis_faellig"] = (due - iss).dt.days
+        object_cols = df.select_dtypes(include=["object", "string"]).columns
+        for col in object_cols:
+            df[col] = strip_lower(df[col])
 
-        return out
+        if self.amount_col and self.amount_col in df.columns:
+            df["Betrag_parsed"] = safe_amount(df[self.amount_col]).astype(float)
 
-class MergeDateFeatures(BaseEstimator, TransformerMixin):
-    """Hängt die von DateFeatureExtractor erzeugten Spalten an das Original-DataFrame an."""
-    def __init__(self, datefe: DateFeatureExtractor):
-        self.datefe = datefe
+        date_cols = list(self.date_columns)
+        for candidate in (self.issue_col, self.due_col):
+            if candidate and candidate not in date_cols:
+                date_cols.append(candidate)
+        for col in date_cols:
+            if col in df.columns:
+                df[col] = parse_date_series(df[col])
+        return df
 
-    def fit(self, X, y=None):
-        self.datefe.fit(X, y)
-        return self
 
-    def transform(self, X):
-        X = pd.DataFrame(X).copy()
-        d = self.datefe.transform(X)
-        for c in d.columns:
-            X[c] = d[c]
-        return X
+class DaysUntilDueAdder(BaseEstimator, TransformerMixin):
+    """Add tage_bis_faellig numerical feature from issue and due date columns."""
 
-class TextConcatenator(BaseEstimator, TransformerMixin):
-    """Fasst mehrere Textspalten zu einer einzelnen Serie zusammen (für TF-IDF/Embeddings)."""
-    def __init__(self, text_cols: List[str], out_col="TEXT_ALL"):
-        self.text_cols = text_cols or []
+    def __init__(self, issue_col: str = "Belegdatum", due_col: str = "Faellig", out_col: str = "tage_bis_faellig") -> None:
+        self.issue_col = issue_col
+        self.due_col = due_col
         self.out_col = out_col
 
-    def fit(self, X, y=None):
+    def fit(self, X, y=None):  # noqa: D401
+        return self
+
+    def transform(self, X):
+        df = pd.DataFrame(X).copy()
+        if self.issue_col in df.columns and self.due_col in df.columns:
+            issue = df[self.issue_col]
+            due = df[self.due_col]
+            issue_dt = issue if np.issubdtype(issue.dtype, np.datetime64) else parse_date_series(issue)
+            due_dt = due if np.issubdtype(due.dtype, np.datetime64) else parse_date_series(due)
+            df[self.out_col] = pd.to_numeric(days_until_due(issue_dt, due_dt), errors="coerce")
+        else:
+            df[self.out_col] = np.nan
+        return df
+
+
+class SelectColumns(BaseEstimator, TransformerMixin):
+    """Select a subset of columns, dropping missing ones gracefully."""
+
+    def __init__(self, columns: Sequence[str]) -> None:
+        self.columns = list(columns)
+
+    def fit(self, X, y=None):  # noqa: D401
+        df = pd.DataFrame(X)
+        self.columns_ = [col for col in self.columns if col in df.columns]
+        self.missing_ = [col for col in self.columns if col not in df.columns]
         return self
 
     def transform(self, X):
         df = pd.DataFrame(X)
-        if not self.text_cols:
-            return pd.DataFrame({self.out_col: [""] * len(df)})
-        conc = df[self.text_cols].astype(str).replace("nan","").apply(
-            lambda r: " ".join([x for x in r if x and x != "nan"]), axis=1
-        )
-        return pd.DataFrame({self.out_col: conc})
+        available = [col for col in getattr(self, "columns_", []) if col in df.columns]
+        return df[available]
 
-class SentenceTransformerEncoder(BaseEstimator, TransformerMixin):
-    """Optionaler lokaler Embedding-Encoder (CPU-tauglich)."""
-    def __init__(self, text_col="TEXT_ALL", model_name="sentence-transformers/all-MiniLM-L6-v2"):
-        self.text_col = text_col
-        self.model_name = model_name
-        self.model_ = None
 
-    def fit(self, X, y=None):
-        texts = pd.Series(X[self.text_col]).fillna("").astype(str).tolist()
-        # Lazy import (install: sentence-transformers)
-        from sentence_transformers import SentenceTransformer
-        self.model_ = SentenceTransformer(self.model_name)
-        # einmal durchlaufen, sorgt für Download/Caching & Shapes
-        _ = self.model_.encode(texts[:8])
+class TextConcatenator(BaseEstimator, TransformerMixin):
+    """Concatenate multiple text columns into a single cleaned string per row."""
+
+    def __init__(self, separator: str = " ") -> None:
+        self.separator = separator
+
+    def fit(self, X, y=None):  # noqa: D401
         return self
 
     def transform(self, X):
-        check_is_fitted(self, "model_")
-        texts = pd.Series(X[self.text_col]).fillna("").astype(str).tolist()
-        vecs = self.model_.encode(texts, normalize_embeddings=True)
-        return vecs  # 2D numpy array
+        df = pd.DataFrame(X)
+        combined: List[str] = []
+        for _, row in df.iterrows():
+            parts: List[str] = []
+            for value in row.tolist():
+                if pd.isna(value):
+                    continue
+                text = str(value).strip()
+                if text:
+                    parts.append(text)
+            combined.append(self.separator.join(parts))
+        return np.asarray(combined, dtype=object)
 
-# ----------------------
-# Hauptlogik
-# ----------------------
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--excel", required=True, help="Pfad zur Excel-Datei")
-    ap.add_argument("--sheet", default="0", help="Sheet-Name oder Index")
-    ap.add_argument("--target", default=None, help="Zielspalte (z. B. Ampel)")
-    ap.add_argument("--use-embeddings", action="store_true", help="Lokale Embeddings statt TF-IDF für Text")
-    ap.add_argument("--tfidf-maxfeatures", type=int, default=5000)
-    ap.add_argument("--model-out", default="model.joblib")
-    ap.add_argument("--prep-out", default="preprocessor.joblib")
-    ap.add_argument("--report-out", default="report.txt")
-    args = ap.parse_args()
+# =============================================================================
+# Core pipeline builder
+# =============================================================================
 
-    sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
 
-    # Excel laden (alles als str, damit wir formatrobust parsen können)
-    df_raw = pd.read_excel(args.excel, sheet_name=sheet, dtype=str)
-    original_cols = list(df_raw.columns)
+@dataclass
+class FeaturePlan:
+    numeric: List[str]
+    categorical: List[str]
+    text: List[str]
 
-    # Spaltennamen normalisieren (für stabile Referenzen)
-    df_raw.columns = [normalize_colname(c) for c in df_raw.columns]
+    @property
+    def all(self) -> List[str]:
+        ordered: List[str] = []
+        for group in (self.numeric, self.categorical, self.text):
+            for col in group:
+                if col not in ordered:
+                    ordered.append(col)
+        return ordered
 
-    # Mapping der bekannten Spalten (aus deiner Liste)
-    # Original -> Normalisiert (zum Verständnis)
-    # Land -> Land
-    # BUK -> BUK
-    # DEB Name -> DEB_Name
-    # Rechnungsnummer -> Rechnungsnummer
-    # Belegdatum -> Belegdatum
-    # Betrag -> Betrag
-    # Fällig -> Faellig
-    # Debitor -> Debitor
-    # Ampel -> Ampel
-    # Maßnahme 2025 -> Massnahme_2025
-    # MA DRM -> MA_DRM
-    # Datum -> Datum
-    # Hinweise -> Hinweise
-    # Rücklauf -> Ruecklauf
-    # WV -> WV
-    # Ticket-nummer -> Ticketnummer
-    # Rückmeldung erhalten -> Rueckmeldung_erhalten
-    # negativ -> negativ
 
-    # Zielspalte prüfen
-    target = args.target
-    if target:
-        target = normalize_colname(target)
-        if target not in df_raw.columns:
-            print(f"⚠️ Zielspalte '{args.target}' nicht gefunden (nach Normalisierung '{target}'). Es wird kein Modell trainiert.")
-            target = None
+def infer_feature_plan(df: pd.DataFrame) -> FeaturePlan:
+    numeric_candidates = ["Betrag_parsed", "tage_bis_faellig"]
+    categorical_candidates = ["Land", "BUK", "Debitor"]
+    text_candidates = ["DEB_Name", "Massnahme_2025", "Hinweise"]
 
-    # Typ-Set/Liste für deine Excel (fester Plan statt kompletter Auto-Erkennung)
-    amount_col = "Betrag" if "Betrag" in df_raw.columns else None
-    beleg_col  = "Belegdatum" if "Belegdatum" in df_raw.columns else None
-    faellig_col= "Faellig" if "Faellig" in df_raw.columns else None
+    numeric = [col for col in numeric_candidates if col in df.columns and df[col].notna().any()]
+    categorical = [col for col in categorical_candidates if col in df.columns]
+    text = [col for col in text_candidates if col in df.columns]
 
-    # Categorical-Felder (Low-Cardinality)
-    categorical_cols = [c for c in [
-        "Land","BUK","DEB_Name","Rechnungsnummer","Debitor","MA_DRM","WV","Ticketnummer",
-        "Rueckmeldung_erhalten","negativ"
-    ] if c in df_raw.columns]
+    return FeaturePlan(numeric=numeric, categorical=categorical, text=text)
 
-    # Numerik (explizit Betrag; später kommen Datums-Features dazu)
-    numeric_cols = []
-    if amount_col and amount_col in df_raw.columns:
-        df_raw[amount_col] = to_numeric_series(df_raw[amount_col])
-        numeric_cols.append(amount_col)
-        # Bonus: Log-Betrag als Feature (robust gegen Schiefe)
-        df_raw["Betrag_log1p"] = np.log1p(df_raw[amount_col].clip(lower=0))
-        numeric_cols.append("Betrag_log1p")
 
-    # Textfelder sinnvoll zusammenführen
-    text_cols = [c for c in ["Hinweise","Massnahme_2025","Ruecklauf"] if c in df_raw.columns]
-    # Zusätzlich kurze, semi-textuelle Felder mitnehmen (nicht doppelt, falls schon kategorial):
-    short_text_candidates = [c for c in ["DEB_Name","Rechnungsnummer"] if c in df_raw.columns and c not in categorical_cols]
-    text_cols += [c for c in short_text_candidates if c not in text_cols]
-
-    # Eine Sammelspalte TEXT_ALL bauen
-    txt_concat = TextConcatenator(text_cols=text_cols, out_col="TEXT_ALL")
-    df_text = txt_concat.transform(df_raw)
-    df_work = pd.concat([df_raw, df_text], axis=1)
-
-    # Datumsfeatures
-    date_cols = [c for c in ["Belegdatum","Faellig","Datum"] if c in df_work.columns]
-    datefe = DateFeatureExtractor(beleg_col=beleg_col, faellig_col=faellig_col, date_cols=date_cols)
-
-    # Pipeline-Parts
-    numeric_pipe = Pipeline([
-        ("impute", SimpleImputer(strategy="median")),
-        ("scale", StandardScaler())
-    ])
-
-    categorical_pipe = Pipeline([
-        ("impute", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=True))
-    ])
-
-    # Textpipeline: TF-IDF (Standard) oder lokale Embeddings (optional)
-    if args.use_embeddings:
-        text_pipe = Pipeline([
-            ("impute", SimpleImputer(strategy="constant", fill_value="")),
-            # ColumnTransformer gibt 2D zurück -> greife Spalte per Funktions-Wrapper
-            ("to_series", FunctionTransformer(lambda X: pd.Series(X.ravel()), validate=False)),
-            ("rename", FunctionTransformer(lambda s: pd.DataFrame({"TEXT_ALL": s}), validate=False)),
-            ("emb", SentenceTransformerEncoder(text_col="TEXT_ALL"))
-        ])
-    else:
-        text_pipe = Pipeline([
-            ("impute", SimpleImputer(strategy="constant", fill_value="")),
-            ("to_series", FunctionTransformer(lambda X: pd.Series(X.ravel()), validate=False)),
-            ("tfidf", TfidfVectorizer(max_features=args.tfidf_maxfeatures, ngram_range=(1,2)))
-        ])
-
-    # Kleiner Import hier, damit sklearn-Versionen ohne FunctionTransformer nicht stolpern:
-    from sklearn.preprocessing import FunctionTransformer
-
-    # ColumnTransformer: wir geben Listen der existierenden Spalten rein
-    used_numeric = [c for c in numeric_cols if c in df_work.columns]
-    used_categorical = [c for c in categorical_cols if c in df_work.columns]
-    used_text = ["TEXT_ALL"] if "TEXT_ALL" in df_work.columns else []
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_pipe, used_numeric),
-            ("cat", categorical_pipe, used_categorical),
-            ("text", text_pipe, used_text)
-        ],
-        remainder="drop",
-        verbose_feature_names_out=False
+def build_preprocessor(feature_plan: FeaturePlan) -> Pipeline:
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("impute", SimpleImputer(strategy="median")),
+            ("scale", StandardScaler(with_mean=False)),
+        ]
     )
 
-    # Gesamt-Pipeline: DateFeatures zuerst mergen, dann ColumnTransformer
-    full_pipeline = Pipeline([
-        ("merge_dates", MergeDateFeatures(datefe)),
-        ("prep", preprocessor)
-    ])
+    categorical_pipeline = Pipeline(
+        steps=[
+            ("impute", SimpleImputer(strategy="most_frequent")),
+            ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
+        ]
+    )
 
-    report = []
-    report.append("# Build report\n")
-    report.append(f"- Original columns: {original_cols}")
-    report.append(f"- Normalized columns: {list(df_raw.columns)}\n")
-    report.append("## Feature-Plan\n")
-    report.append(f"- Betrag-Spalte: {amount_col}")
-    report.append(f"- Datums-Spalten (Beleg/Faellig/Datum): {beleg_col}, {faellig_col}, {[c for c in date_cols]}")
-    report.append(f"- Numerik (inkl. log1p): {used_numeric}")
-    report.append(f"- Kategorisch: {used_categorical}")
-    report.append(f"- Textspalten -> TEXT_ALL: {text_cols}  (Encoder: {'Embeddings' if args.use_embeddings else 'TF-IDF'})\n")
+    text_pipeline = Pipeline(
+        steps=[
+            ("concat", TextConcatenator()),
+            (
+                "tfidf",
+                TfidfVectorizer(
+                    ngram_range=(1, 2),
+                    min_df=2,
+                    max_features=4000,
+                    dtype=np.float32,
+                ),
+            ),
+        ]
+    )
 
-    # Fit & optional Train
-    if target:
-        y = df_work[target].copy()
-        X = df_work.drop(columns=[target])
-        # stratify nur wenn mehrere Klassen vorhanden
-        strat = y if y.nunique() > 1 else None
-        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=42, stratify=strat)
+    column_transformer = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipeline, feature_plan.numeric),
+            ("cat", categorical_pipeline, feature_plan.categorical),
+            ("text", text_pipeline, feature_plan.text),
+        ],
+        remainder="drop",
+        sparse_threshold=0.3,
+        verbose_feature_names_out=False,
+    )
 
-        Ztr = full_pipeline.fit_transform(Xtr)
-        Zte = full_pipeline.transform(Xte)
+    pipeline = Pipeline(
+        steps=[
+            (
+                "prep_df",
+                DataFramePreparer(
+                    amount_col="Betrag",
+                    issue_col="Belegdatum",
+                    due_col="Faellig",
+                    date_columns=["Datum"],
+                ),
+            ),
+            ("add_due_days", DaysUntilDueAdder(issue_col="Belegdatum", due_col="Faellig")),
+            ("select", SelectColumns(feature_plan.all)),
+            ("encode", column_transformer),
+        ]
+    )
+    return pipeline
 
-        clf = RandomForestClassifier(
-            n_estimators=400,
+
+# =============================================================================
+# CLI logic
+# =============================================================================
+
+
+def read_excel(path: Path, sheet: str | int) -> pd.DataFrame:
+    return pd.read_excel(path, sheet_name=sheet, dtype="object")
+
+
+def normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    mapping = {col: normalize_column_name(col) for col in df.columns}
+    renamed = df.rename(columns=mapping)
+    return renamed, mapping
+
+
+def run_pipeline_builder(args: argparse.Namespace) -> int:
+    excel_path = Path(args.excel)
+    if not excel_path.exists():
+        raise FileNotFoundError(f"Excel file not found: {excel_path}")
+
+    sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
+    df_raw = read_excel(excel_path, sheet)
+    df_norm, column_mapping = normalize_columns(df_raw)
+
+    target_name = None
+    y = None
+    df_features = df_norm.copy()
+
+    if args.target:
+        normalized_target = normalize_column_name(args.target)
+        if normalized_target in df_norm.columns:
+            raw_target = pd.Series(df_norm[normalized_target], dtype="object")
+            target_clean = raw_target.astype("string").str.strip()
+            target_clean = target_clean.replace({"": pd.NA})
+            mask = target_clean.notna()
+            if mask.any():
+                target_name = normalized_target
+                y = target_clean.loc[mask].astype("string")
+                df_features = df_features.loc[mask]
+            else:
+                print(
+                    f"Warning: target column '{args.target}' exists but contains no labels after cleaning; baseline will be skipped.",
+                    file=sys.stderr,
+                )
+            df_features = df_features.drop(columns=[normalized_target])
+        else:
+            print(
+                f"Warning: target column '{args.target}' not found after normalization (expected '{normalized_target}').",
+                file=sys.stderr,
+            )
+    df_features = df_features.reset_index(drop=True)
+    if y is not None:
+        y = y.reset_index(drop=True)
+
+    preparer_preview = DataFramePreparer(
+        amount_col="Betrag",
+        issue_col="Belegdatum",
+        due_col="Faellig",
+        date_columns=["Datum"],
+    )
+    prepared = preparer_preview.fit_transform(df_features)
+    with_due = DaysUntilDueAdder(issue_col="Belegdatum", due_col="Faellig").fit_transform(prepared)
+
+    feature_plan = infer_feature_plan(with_due)
+
+    preprocessor = build_preprocessor(feature_plan)
+    preprocessor.fit(df_features)
+
+    prep_out = Path(args.prep_out)
+    ensure_directory(prep_out)
+    joblib.dump(preprocessor, prep_out)
+
+    profile = {
+        "input_excel": str(excel_path),
+        "sheet": sheet,
+        "column_mapping": column_mapping,
+        "feature_plan": {
+            "numeric": feature_plan.numeric,
+            "categorical": feature_plan.categorical,
+            "text": feature_plan.text,
+        },
+        "dropped_columns": getattr(preprocessor.named_steps["prep_df"], "columns_to_drop_", []),
+    }
+
+    metrics = None
+    model_path = None
+    metrics_path = None
+
+    if target_name and y is not None and y.nunique(dropna=True) > 1:
+        stratify = y if y.nunique(dropna=True) > 1 else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            df_features,
+            y,
+            test_size=0.2,
             random_state=42,
-            n_jobs=-1,
-            class_weight="balanced"
+            stratify=stratify,
         )
-        clf.fit(Ztr, ytr)
-        yhat = clf.predict(Zte)
 
-        cr = classification_report(yte, yhat, digits=3)
-        cm = confusion_matrix(yte, yhat)
+        baseline_model = Pipeline(
+            steps=[
+                ("preprocessor", build_preprocessor(feature_plan)),
+                (
+                    "classifier",
+                    RandomForestClassifier(
+                        n_estimators=300,
+                        random_state=42,
+                        n_jobs=-1,
+                        class_weight="balanced",
+                    ),
+                ),
+            ]
+        )
 
-        report.append("## Klassifikationsbericht (Test)\n")
-        report.append("```\n" + cr + "\n```")
-        report.append("Confusion Matrix (Zeilen=Ist, Spalten=Vorhersage):\n" + str(cm) + "\n")
+        baseline_model.fit(X_train, y_train)
+        y_pred = baseline_model.predict(X_test)
 
-        joblib.dump(clf, args.model_out)
-        report.append(f"✔️ Modell gespeichert: {args.model_out}")
-    else:
-        # Nur Preprocessor fitten (z. B. für spätere Nutzung)
-        _ = full_pipeline.fit_transform(df_work)
-        report.append("ℹ️ Kein Ziel vorhanden — nur Preprocessor fit_transform ausgeführt.")
+        metrics = {
+            "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+            "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
+            "classification_report": classification_report(y_test, y_pred, zero_division=0),
+            "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
+        }
 
-    joblib.dump(full_pipeline, args.prep_out)
-    report.append(f"✔️ Preprocessor gespeichert: {args.prep_out}")
+        model_path = Path(args.model_out)
+        ensure_directory(model_path)
+        joblib.dump(baseline_model, model_path)
 
-    Path(args.report_out).write_text("\n".join(report), encoding="utf-8")
-    print("\n".join(report))
+        metrics_path = Path(args.metrics_out)
+        ensure_directory(metrics_path)
+        metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+        profile["baseline_model"] = str(model_path)
+        profile["metrics_file"] = str(metrics_path)
+
+    elif target_name:
+        print(
+            "Warning: Target available but only a single class after cleaning; baseline model skipped.",
+            file=sys.stderr,
+        )
+
+    profile_path = Path(args.report_out)
+    ensure_directory(profile_path)
+    profile_path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+
+    print(f"Saved preprocessor to {prep_out}")
+    if model_path:
+        print(f"Saved baseline model to {model_path}")
+    if metrics_path:
+        print(f"Saved metrics to {metrics_path}")
+    print(f"Profile written to {profile_path}")
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Build Veri preprocessing pipeline")
+    parser.add_argument("--excel", required=True, help="Path to Excel file with Veri data")
+    parser.add_argument("--sheet", default="0", help="Sheet name or index")
+    parser.add_argument("--target", default=None, help="Target column for baseline training")
+    parser.add_argument("--prep-out", default="outputs/prep_pipeline.joblib", help="Path to save preprocessing pipeline")
+    parser.add_argument("--model-out", default="outputs/model.joblib", help="Path to save baseline model")
+    parser.add_argument("--metrics-out", default="outputs/metrics.json", help="Path to save baseline metrics")
+    parser.add_argument("--report-out", default="outputs/profile.json", help="Path to save profile report")
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    return run_pipeline_builder(args)
 
 
 if __name__ == "__main__":
