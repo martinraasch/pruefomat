@@ -627,6 +627,39 @@ def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
     return "Report erstellt.", markdown_text, str(md_path), state
 
 
+def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
+    state = state or {}
+    model = state.get("baseline_model")
+    if model is None:
+        return "Bitte zuerst Baseline trainieren.", None
+
+    if upload is None:
+        return "Bitte eine Excel-Datei hochladen.", None
+
+    with gr.Progress(track_tqdm=False) as progress:
+        progress(0.05, desc="Lade Datei")
+        df_input = pd.read_excel(upload.name)
+        progress(0.3, desc="Berechne Scores")
+        scores = model.predict_proba(df_input)[:, -1]
+        predictions = (scores >= 0.5).astype(int)
+        df_out = df_input.copy()
+        df_out["fraud_score"] = scores * 100.0
+        df_out["prediction"] = predictions
+        progress(0.8, desc="Schreibe Ergebnis")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_batch_"))
+        out_path = tmp_dir / "batch_predictions.xlsx"
+        df_out.to_excel(out_path, index=False)
+        progress(1.0, desc="Fertig")
+
+    logger.info(
+        "ui_batch_prediction_completed",
+        rows=len(df_input),
+        output=str(out_path),
+    )
+
+    return "Batch abgeschlossen.", str(out_path)
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -637,9 +670,6 @@ def build_interface() -> gr.Blocks:
         gr.Markdown(
             """
             # pruefomat – Fraud/Veri-Selector
-            1. Excel laden und Schema pruefen.
-            2. Pipeline bauen (Preprocessing + Feature-Encoding).
-            3. Optional Baseline trainieren und Ergebnisse inspizieren.
             """
         )
 
@@ -648,48 +678,56 @@ def build_interface() -> gr.Blocks:
             "config_path": str(DEFAULT_CONFIG_PATH),
         })
 
-        with gr.Row():
-            file_input = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
-            config_input = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
-            sheet_input = gr.Textbox(value="0", label="Sheet (Index oder Name)")
-            target_input = gr.Textbox(value=DEFAULT_CONFIG.data.target_col or "", label="Zielspalte (optional)")
-            load_btn = gr.Button("Daten laden")
+        with gr.Tabs():
+            with gr.Tab("Training & Analyse"):
+                with gr.Row():
+                    file_input = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+                    config_input = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                    sheet_input = gr.Textbox(value="0", label="Sheet (Index oder Name)")
+                    target_input = gr.Textbox(value=DEFAULT_CONFIG.data.target_col or "", label="Zielspalte (optional)")
+                    load_btn = gr.Button("Daten laden")
 
-        load_status = gr.Textbox(label="Status", interactive=False)
-        data_preview = gr.Dataframe(label="Daten (erste Zeilen)", interactive=False)
-        schema_json = gr.JSON(label="Schema / Mapping")
+                load_status = gr.Textbox(label="Status", interactive=False)
+                data_preview = gr.Dataframe(label="Daten (erste Zeilen)", interactive=False)
+                schema_json = gr.JSON(label="Schema / Mapping")
 
-        gr.Markdown("## Pipeline")
-        build_btn = gr.Button("Pipeline bauen")
-        build_status = gr.Textbox(label="Pipeline-Status", interactive=False)
-        plan_json = gr.JSON(label="Feature-Plan")
-        prep_download = gr.File(label="Preprocessor Download", interactive=False)
+                gr.Markdown("## Pipeline")
+                build_btn = gr.Button("Pipeline bauen")
+                build_status = gr.Textbox(label="Pipeline-Status", interactive=False)
+                plan_json = gr.JSON(label="Feature-Plan")
+                prep_download = gr.File(label="Preprocessor Download", interactive=False)
 
-        preview_btn = gr.Button("Features Vorschau")
-        preview_status = gr.Textbox(label="Preview-Status", interactive=False)
-        preview_table = gr.Dataframe(label="Transformierte Features", interactive=False)
+                preview_btn = gr.Button("Features Vorschau")
+                preview_status = gr.Textbox(label="Preview-Status", interactive=False)
+                preview_table = gr.Dataframe(label="Transformierte Features", interactive=False)
 
-        gr.Markdown("## Baseline Modell")
-        baseline_btn = gr.Button("Baseline trainieren")
-        baseline_status = gr.Textbox(label="Baseline-Status", interactive=False)
-        metrics_json = gr.JSON(label="Metriken")
-        confusion_df = gr.Dataframe(label="Confusion Matrix", interactive=False)
-        model_download = gr.File(label="Baseline Modell", interactive=False)
-        metrics_download = gr.File(label="Metrics JSON", interactive=False)
-        importance_table = gr.Dataframe(label="Feature Importanzen (Top 20)", interactive=False)
-        importance_plot = gr.Image(label="Feature Importance Chart", interactive=False)
-        importance_download = gr.File(label="Feature Importances CSV", interactive=False)
-        predictions_table = gr.Dataframe(label="Predictions (Test Set, sortiert nach Risiko)", interactive=False)
-        predictions_download = gr.File(label="Predictions CSV", interactive=False)
-        explain_index = gr.Number(label="Zeilenindex für Erklärung", value=0, precision=0)
-        explain_btn = gr.Button("Erklärung anzeigen")
-        explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
-        explain_json = gr.JSON(label="Top-Features (SHAP)")
-        explain_download = gr.File(label="Erklärungs-JSON", interactive=False)
-        report_btn = gr.Button("Pattern Report generieren")
-        report_status = gr.Textbox(label="Report-Status", interactive=False)
-        report_preview = gr.Markdown(label="Report Vorschau")
-        report_download = gr.File(label="Report Download", interactive=False)
+                gr.Markdown("## Baseline Modell")
+                baseline_btn = gr.Button("Baseline trainieren")
+                baseline_status = gr.Textbox(label="Baseline-Status", interactive=False)
+                metrics_json = gr.JSON(label="Metriken")
+                confusion_df = gr.Dataframe(label="Confusion Matrix", interactive=False)
+                model_download = gr.File(label="Baseline Modell", interactive=False)
+                metrics_download = gr.File(label="Metrics JSON", interactive=False)
+                importance_table = gr.Dataframe(label="Feature Importanzen (Top 20)", interactive=False)
+                importance_plot = gr.Image(label="Feature Importance Chart", interactive=False)
+                importance_download = gr.File(label="Feature Importances CSV", interactive=False)
+                predictions_table = gr.Dataframe(label="Predictions (Test Set, sortiert nach Risiko)", interactive=False)
+                predictions_download = gr.File(label="Predictions CSV", interactive=False)
+                explain_index = gr.Number(label="Zeilenindex für Erklärung", value=0, precision=0)
+                explain_btn = gr.Button("Erklärung anzeigen")
+                explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
+                explain_json = gr.JSON(label="Top-Features (SHAP)")
+                explain_download = gr.File(label="Erklärungs-JSON", interactive=False)
+                report_btn = gr.Button("Pattern Report generieren")
+                report_status = gr.Textbox(label="Report-Status", interactive=False)
+                report_preview = gr.Markdown(label="Report Vorschau")
+                report_download = gr.File(label="Report Download", interactive=False)
+
+            with gr.Tab("Batch Prediction"):
+                batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+                batch_button = gr.Button("Belege prüfen")
+                batch_status = gr.Textbox(label="Batch-Status", interactive=False)
+                batch_download = gr.File(label="Batch Download", interactive=False)
 
         load_btn.click(
             load_dataset,
@@ -737,6 +775,12 @@ def build_interface() -> gr.Blocks:
             generate_pattern_report_action,
             inputs=[state],
             outputs=[report_status, report_preview, report_download, state],
+        )
+
+        batch_button.click(
+            batch_predict_action,
+            inputs=[batch_file, state],
+            outputs=[batch_status, batch_download],
         )
 
     return demo
