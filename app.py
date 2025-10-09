@@ -141,11 +141,58 @@ def _reset_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
-def load_dataset(upload, config_upload, sheet_text: str, target_text: str, state: Optional[Dict[str, Any]]):
+def _collect_excel_files(upload, folder_text: str | None) -> tuple[list[Path], list[str]]:
+    paths: list[Path] = []
+    warnings_list: list[str] = []
+
+    if upload is not None:
+        uploads = upload if isinstance(upload, list) else [upload]
+        for item in uploads:
+            try:
+                path = Path(item.name)
+            except AttributeError:  # pragma: no cover - defensive
+                continue
+            if not path.exists():
+                warnings_list.append(f"Datei nicht gefunden: {path}")
+                continue
+            if path.suffix.lower() not in {".xlsx", ".xls"}:
+                warnings_list.append(f"Überspringe nicht unterstützte Datei: {path.name}")
+                continue
+            paths.append(path)
+
+    if folder_text:
+        folder = Path(folder_text).expanduser()
+        if folder.exists() and folder.is_file() and folder.suffix.lower() in {".xlsx", ".xls"}:
+            paths.append(folder)
+        elif folder.exists() and folder.is_dir():
+            excel_files = sorted(
+                {p for ext in ("*.xlsx", "*.xls") for p in folder.rglob(ext)}
+            )
+            if not excel_files:
+                warnings_list.append(f"Im Ordner wurden keine Excel-Dateien gefunden: {folder}")
+            else:
+                paths.extend(excel_files)
+        else:
+            warnings_list.append(f"Ordner/Datei nicht gefunden: {folder}")
+
+    deduped: list[Path] = []
+    seen = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in seen:
+            deduped.append(resolved)
+            seen.add(resolved)
+    return deduped, warnings_list
+
+
+def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folder_text: str, state: Optional[Dict[str, Any]]):
     state = state or {}
-    if upload is None:
-        logger.warning("ui_no_file")
-        return "Bitte zuerst eine Excel-Datei hochladen.", None, None, state
+
+    excel_paths, warnings_list = _collect_excel_files(upload, folder_text)
+    if not excel_paths:
+        logger.warning("ui_no_file", folder=folder_text or None)
+        warn = warnings_list[0] if warnings_list else "Bitte zuerst eine Excel-Datei oder einen Ordner auswählen."
+        return warn, None, None, state
 
     config_path: Optional[str]
     if config_upload is not None:
@@ -172,41 +219,63 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, state
     state["config_path"] = config_path
 
     sheet = _parse_sheet(sheet_text)
-    try:
-        df_raw = pd.read_excel(upload.name, sheet_name=sheet, dtype="object")
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "ui_excel_error",
-            message=str(exc),
-            file=upload.name,
-            sheet=sheet,
-        )
-        return f"Fehler beim Laden: {exc}", None, None, state
+    frames: list[pd.DataFrame] = []
+    column_mappings: dict[str, dict[str, str]] = {}
+    total_rows = 0
+    errors: list[str] = []
 
-    df_norm, column_mapping = normalize_columns(df_raw)
-    logger.info(
-        "ui_dataset_loaded",
-        file=upload.name,
-        sheet=sheet,
-        rows=len(df_norm),
-        columns=df_norm.shape[1],
-    )
+    for idx, path in enumerate(excel_paths, start=1):
+        try:
+            df_raw = pd.read_excel(path, sheet_name=sheet, dtype="object")
+        except Exception as exc:  # pragma: no cover
+            message = f"Fehler beim Laden {path.name}: {exc}"
+            logger.error(
+                "ui_excel_error",
+                message=str(exc),
+                file=str(path),
+                sheet=sheet,
+            )
+            errors.append(message)
+            continue
+
+        df_norm, column_mapping = normalize_columns(df_raw)
+        df_norm["source_file"] = path.name
+        frames.append(df_norm)
+        column_mappings[path.name] = column_mapping
+        total_rows += len(df_norm)
+        logger.info(
+            "ui_dataset_loaded",
+            file=str(path),
+            sheet=sheet,
+            rows=len(df_norm),
+            columns=df_norm.shape[1],
+        )
+
+    if not frames:
+        first_error = errors[0] if errors else "Keine gültigen Excel-Dateien gefunden."
+        if warnings_list:
+            errors = warnings_list + errors
+        return first_error, None, None, state
+
+    df_norm_all = pd.concat(frames, ignore_index=True, sort=False)
+    if "source_file" in df_norm_all.columns:
+        df_norm_all["source_file"] = df_norm_all["source_file"].fillna("unbekannt")
 
     target_norm = config.data.target_col
     target_series = None
-    df_features = df_norm
+    df_features = df_norm_all
     target_msg = "Keine Zielspalte gesetzt."
-    if target_norm and target_norm in df_norm.columns:
-        target_numeric = pd.to_numeric(df_norm[target_norm], errors="coerce")
+    if target_norm and target_norm in df_norm_all.columns:
+        target_numeric = pd.to_numeric(df_norm_all[target_norm], errors="coerce")
         mask = target_numeric.notna()
         if mask.any():
             target_series = target_numeric.loc[mask].astype(int)
-            df_features = df_norm.loc[mask].drop(columns=[target_norm])
+            df_features = df_norm_all.loc[mask].drop(columns=[target_norm])
             target_msg = f"Zielspalte erkannt: {target_norm}"
             logger.info("ui_target_detected", target=target_norm)
         else:
             target_msg = f"Zielspalte '{target_norm}' enthält keine nutzbaren Werte."
-            df_features = df_norm.drop(columns=[target_norm])
+            df_features = df_norm_all.drop(columns=[target_norm])
             logger.warning("ui_target_empty", target=target_norm)
     elif target_norm:
         target_msg = f"Warnung: Zielspalte '{target_norm}' nicht gefunden."
@@ -214,9 +283,10 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, state
 
     state.update(
         {
-            "excel_path": upload.name,
+            "excel_paths": [str(path) for path in excel_paths],
+            "excel_path": str(excel_paths[0]) if excel_paths else None,
             "sheet": sheet,
-            "column_mapping": column_mapping,
+            "column_mapping": column_mappings if len(column_mappings) > 1 else next(iter(column_mappings.values())),
             "df_features": df_features,
             "target": target_series,
             "target_name": target_norm,
@@ -224,17 +294,32 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, state
     )
     state = _reset_pipeline_state(state)
 
-    preview = df_norm.head(8)
-    schema = _format_schema(df_norm)
-    schema["column_mapping"] = mask_sensitive_data(column_mapping)
+    preview = df_norm_all.head(8)
+    schema = _format_schema(df_norm_all)
+    schema["column_mapping"] = (
+        {name: mask_sensitive_data(mapping) for name, mapping in column_mappings.items()}
+        if len(column_mappings) > 1
+        else mask_sensitive_data(next(iter(column_mappings.values())))
+    )
+    schema["sources"] = [path.name for path in excel_paths]
+    if warnings_list:
+        schema["warnings"] = warnings_list
+    if errors:
+        schema["errors"] = errors
     schema["config"] = {
         "config_path": config_path,
         "target_col": target_norm,
     }
 
-    status = (
-        f"Geladen: {Path(upload.name).name} (Sheet {sheet}) | {len(df_norm)} Zeilen, {df_norm.shape[1]} Spalten. {target_msg}"
-    )
+    status_parts = [
+        f"Geladen: {len(excel_paths)} Datei(en) (Sheet {sheet}) | {len(df_norm_all)} Zeilen, {df_norm_all.shape[1]} Spalten.",
+        target_msg,
+    ]
+    if warnings_list:
+        status_parts.append("Hinweise: " + "; ".join(warnings_list))
+    if errors:
+        status_parts.append("Fehler: " + "; ".join(errors))
+    status = " ".join(status_parts)
     return status, preview, schema, state
 
 
@@ -885,7 +970,8 @@ def build_interface() -> gr.Blocks:
         with gr.Tabs():
             with gr.Tab("Training & Analyse"):
                 with gr.Row():
-                    file_input = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+                    file_input = gr.File(label="Excel-Dateien", file_types=[".xlsx", ".xls"], file_count="multiple")  # type: ignore[arg-type]
+                    folder_input = gr.Textbox(label="Ordner (optional)", placeholder="Pfad zu einem Ordner mit Excel-Dateien")
                     config_input = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
                     sheet_input = gr.Textbox(value="0", label="Sheet (Index oder Name)")
                     target_input = gr.Textbox(value=DEFAULT_CONFIG.data.target_col or "", label="Zielspalte (optional)")
@@ -945,7 +1031,7 @@ def build_interface() -> gr.Blocks:
 
         load_btn.click(
             load_dataset,
-            inputs=[file_input, config_input, sheet_input, target_input, state],
+            inputs=[file_input, config_input, sheet_input, target_input, folder_input, state],
             outputs=[load_status, data_preview, schema_json, state],
         )
 
