@@ -421,8 +421,15 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "importance_plot": plot_image,
             "predictions_path": str(predictions_path),
             "shap_feature_names": list(feature_names),
+            "feature_importances": importance_df.to_dict(orient="records"),
         }
     )
+
+    try:
+        state["feature_importance_df"] = importance_df
+        state["notes_text_vectorizer"] = baseline.named_steps["preprocessor"].named_steps["encode"].named_transformers_["text"].named_steps["tfidf"]
+    except Exception as exc:
+        logger.warning("ui_importance_store_failed", message=str(exc))
 
     try:
         background_size = min(200, len(df_features))
@@ -544,6 +551,82 @@ def explain_prediction_action(state: Optional[Dict[str, Any]], row_index):
     return f"Top-Features für Zeile {idx}", explanation, str(json_path), state
 
 
+def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
+    state = state or {}
+    df_features = state.get("df_features")
+    target = state.get("target")
+    feature_importance = state.get("feature_importance_df")
+    vectorizer = state.get("notes_text_vectorizer")
+
+    if df_features is None or target is None or feature_importance is None:
+        return "Bitte zuerst Baseline trainieren.", None, state
+
+    report_lines = ["# Fraud Pattern Report", ""]
+    top_features = feature_importance.head(10)
+    report_lines.append("## Top Risiko-Features")
+    for _, row in top_features.iterrows():
+        report_lines.append(f"- **{row['feature']}**: Importance {row['importance']:.4f}")
+    report_lines.append("")
+
+    df_local = df_features.copy()
+    y = target.astype(int)
+    df_local["is_fraud"] = y
+
+    report_lines.append("## Fraud-Rate nach Land")
+    if "Land" in df_local.columns:
+        table_land = df_local.groupby("Land")["is_fraud"].mean().sort_values(ascending=False)
+        report_lines.append("| Land | Fraud-Rate |")
+        report_lines.append("| --- | --- |")
+        for land, rate in table_land.items():
+            report_lines.append(f"| {land} | {rate:.2%} |")
+    else:
+        report_lines.append("Keine Spalte 'Land' vorhanden.")
+    report_lines.append("")
+
+    report_lines.append("## Fraud-Rate nach BUK")
+    if "BUK" in df_local.columns:
+        table_buk = df_local.groupby("BUK")["is_fraud"].mean().sort_values(ascending=False)
+        report_lines.append("| BUK | Fraud-Rate |")
+        report_lines.append("| --- | --- |")
+        for buk, rate in table_buk.items():
+            report_lines.append(f"| {buk} | {rate:.2%} |")
+    else:
+        report_lines.append("Keine Spalte 'BUK' vorhanden.")
+    report_lines.append("")
+
+    report_lines.append("## Betragsanalyse")
+    if "Betrag_parsed" in df_local.columns:
+        fraud_amount = df_local.loc[df_local["is_fraud"] == 1, "Betrag_parsed"].mean()
+        non_amount = df_local.loc[df_local["is_fraud"] == 0, "Betrag_parsed"].mean()
+        report_lines.append(f"- Durchschnittlicher Betrag (Fraud): {fraud_amount:.2f}")
+        report_lines.append(f"- Durchschnittlicher Betrag (Normal): {non_amount:.2f}")
+    else:
+        report_lines.append("Betragsspalte nicht vorhanden.")
+    report_lines.append("")
+
+    report_lines.append("## Text-Keywords")
+    if vectorizer is not None:
+        feature_names = vectorizer.get_feature_names_out()
+        fraud_texts = df_features.loc[y == 1, "notes_text"].fillna("")
+        if not fraud_texts.empty:
+            transformed = vectorizer.transform(fraud_texts)
+            summed = np.asarray(transformed.sum(axis=0)).ravel()
+            top_idx = np.argsort(summed)[::-1][:10]
+            for idx in top_idx:
+                report_lines.append(f"- {feature_names[idx]} (Gewicht {summed[idx]:.2f})")
+        else:
+            report_lines.append("Keine Fraud-Texte vorhanden.")
+    else:
+        report_lines.append("Text-Vektorisierer nicht verfügbar.")
+
+    markdown_text = "\n".join(report_lines)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_report_"))
+    md_path = tmp_dir / "pattern_report.md"
+    md_path.write_text(markdown_text, encoding="utf-8")
+
+    return "Report erstellt.", markdown_text, str(md_path), state
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -603,6 +686,10 @@ def build_interface() -> gr.Blocks:
         explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
         explain_json = gr.JSON(label="Top-Features (SHAP)")
         explain_download = gr.File(label="Erklärungs-JSON", interactive=False)
+        report_btn = gr.Button("Pattern Report generieren")
+        report_status = gr.Textbox(label="Report-Status", interactive=False)
+        report_preview = gr.Markdown(label="Report Vorschau")
+        report_download = gr.File(label="Report Download", interactive=False)
 
         load_btn.click(
             load_dataset,
@@ -644,6 +731,12 @@ def build_interface() -> gr.Blocks:
             explain_prediction_action,
             inputs=[state, explain_index],
             outputs=[explain_status, explain_json, explain_download, state],
+        )
+
+        report_btn.click(
+            generate_pattern_report_action,
+            inputs=[state],
+            outputs=[report_status, report_preview, report_download, state],
         )
 
     return demo
