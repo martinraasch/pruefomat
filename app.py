@@ -947,7 +947,7 @@ def build_interface() -> gr.Blocks:
 
 def main():
     demo = build_interface()
-    demo.launch(share=False, analytics_enabled=False, show_error=True)
+    demo.launch(share=False, show_error=True)
 
 
 if __name__ == "__main__":
