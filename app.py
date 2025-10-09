@@ -690,7 +690,29 @@ def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
     report_lines.append("## Text-Keywords")
     if vectorizer is not None:
         feature_names = vectorizer.get_feature_names_out()
-        fraud_texts = df_features.loc[y == 1, "notes_text"].fillna("")
+
+        text_series = None
+        if "notes_text" in df_features.columns:
+            text_series = df_features["notes_text"].astype(str)
+        else:
+            feature_plan = state.get("feature_plan")
+            candidate_cols: list[str] = []
+            if feature_plan is not None:
+                candidate_cols.extend([col for col in getattr(feature_plan, "text", []) if col in df_features.columns])
+            if not candidate_cols:
+                config = _ensure_config(state)
+                candidate_cols.extend([col for col in config.data.text_columns if col in df_features.columns])
+
+            if candidate_cols:
+                text_source = df_features[candidate_cols].fillna("")
+                text_series = text_source.agg(" ".join, axis=1).astype(str)
+
+        if text_series is not None:
+            fraud_mask = y == 1
+            fraud_texts = text_series.loc[fraud_mask].fillna("")
+        else:
+            fraud_texts = pd.Series(dtype="string")
+
         if not fraud_texts.empty:
             transformed = vectorizer.transform(fraud_texts)
             summed = np.asarray(transformed.sum(axis=0)).ravel()
@@ -796,7 +818,7 @@ def feedback_report_action(state: Optional[Dict[str, Any]]):
         df = pd.read_sql_query("SELECT * FROM feedback", conn, parse_dates=["timestamp"]) if conn else pd.DataFrame()
 
     if df.empty:
-        return "Noch kein Feedback vorhanden.", "", state
+        return "Noch kein Feedback vorhanden.", "", None, state
 
     now = datetime.utcnow()
     last_week = now - timedelta(days=7)
