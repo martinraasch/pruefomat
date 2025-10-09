@@ -426,6 +426,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     )
     predictions_df.sort_values("fraud_score", ascending=False, inplace=True)
     predictions_display = predictions_df.head(50).reset_index(drop=True)
+    predictions_display.columns = ["Index", "Score", "Prediction", "Actual"]
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_model_"))
     model_path = tmp_dir / "baseline_model.joblib"
