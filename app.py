@@ -375,6 +375,8 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     }
     confusion = confusion_matrix(y_test, y_pred)
     confusion_df = pd.DataFrame(confusion)
+    confusion_df.columns = [f"Pred {c}" for c in confusion_df.columns]
+    confusion_df.index = [f"Actual {i}" for i in confusion_df.index]
 
     encoder = baseline.named_steps["preprocessor"].named_steps.get("encode")
     if encoder is not None and hasattr(encoder, "get_feature_names_out"):
@@ -427,6 +429,11 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     predictions_df.sort_values("fraud_score", ascending=False, inplace=True)
     predictions_display = predictions_df.head(50).reset_index(drop=True)
     predictions_display.columns = ["Index", "Score", "Prediction", "Actual"]
+    predictions_display_ui = {
+        "headers": ["Index", "Score", "Prediction", "Actual"],
+        "data": predictions_display.values.astype(object).tolist(),
+        "row_headers": [str(i) for i in range(len(predictions_display))],
+    }
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_model_"))
     model_path = tmp_dir / "baseline_model.joblib"
@@ -461,8 +468,8 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "predictions_path": str(predictions_path),
             "shap_feature_names": list(feature_names),
             "feature_importances": importance_df.to_dict(orient="records"),
-            "predictions_full": predictions_df,
-        }
+        "predictions_full": predictions_df,
+    }
     )
 
     try:
@@ -505,7 +512,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         top20,
         plot_image,
         str(importance_path),
-        predictions_display,
+        predictions_display_ui,
         str(predictions_path),
         state,
     )
