@@ -47,5 +47,6 @@
   "baseline_model": "outputs/model.joblib",
   "metrics_file": "outputs/metrics.json",
   "feature_importance_csv": "outputs/feature_importance.csv",
-  "feature_importance_plot": "outputs/feature_importance.png"
+  "feature_importance_plot": "outputs/feature_importance.png",
+  "predictions_file": "outputs/predictions.csv"
 }

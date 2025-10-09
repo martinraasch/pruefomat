@@ -532,6 +532,48 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
         else:
             plot_path = None
 
+        proba = baseline_model.predict_proba(X_test)
+        if proba.ndim == 1:
+            pos_scores = proba
+        elif proba.shape[1] == 1:
+            pos_scores = proba[:, 0]
+        else:
+            classes = list(baseline_model.named_steps["classifier"].classes_)
+            positive_index = 1 if len(classes) > 1 else 0
+            for candidate in ("1", 1, "fraud", "Fraud", True):
+                if candidate in classes:
+                    positive_index = classes.index(candidate)
+                    break
+            if len(classes) == 2:
+                pos_scores = proba[:, positive_index]
+            else:
+                pos_scores = proba.max(axis=1)
+
+        fraud_scores = pd.Series(pos_scores * 100.0, name="fraud_score")
+        predictions_raw = pd.Series(baseline_model.predict(X_test))
+        predictions_numeric = pd.to_numeric(predictions_raw, errors="coerce")
+        if predictions_numeric.notna().all():
+            predictions_col = predictions_numeric.round().astype(int)
+        else:
+            predictions_col = predictions_raw
+
+        actual_series = pd.Series(y_test).reset_index(drop=True)
+        predictions_col = predictions_col.reset_index(drop=True)
+        fraud_scores = fraud_scores.reset_index(drop=True)
+
+        predictions_df = pd.DataFrame(
+            {
+                "fraud_score": fraud_scores,
+                "prediction": predictions_col,
+                "actual": actual_series,
+            }
+        )
+        predictions_df.sort_values("fraud_score", ascending=False, inplace=True)
+
+        predictions_path = Path(args.predictions_out)
+        ensure_directory(predictions_path)
+        predictions_df.to_csv(predictions_path, index=False)
+
         model_path = Path(args.model_out)
         ensure_directory(model_path)
         joblib.dump(baseline_model, model_path)
@@ -545,6 +587,7 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
         profile["feature_importance_csv"] = str(importance_csv)
         if plot_path:
             profile["feature_importance_plot"] = str(plot_path)
+        profile["predictions_file"] = str(predictions_path)
 
         metric_summary = {
             "recall": metrics["recall"],
@@ -561,6 +604,7 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
             metrics_path=str(metrics_path),
             feature_importance_csv=str(importance_csv),
             feature_importance_plot=str(plot_path) if plot_path else None,
+            predictions_path=str(predictions_path),
         )
     elif target_name:
         logger.warning("baseline_skipped_single_class", target=target_name)
@@ -595,6 +639,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report-out", default="outputs/profile.json", help="Path to save profile report")
     parser.add_argument("--feature-importance-csv", default="outputs/feature_importance.csv", help="Path to save feature importances (CSV)")
     parser.add_argument("--feature-importance-plot", default="outputs/feature_importance.png", help="Path to save feature importance chart (PNG)")
+    parser.add_argument("--predictions-out", default="outputs/predictions.csv", help="Path to save predictions for the test set")
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
     return parser
 

@@ -349,15 +349,56 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     importance_df.sort_values("importance", ascending=False, inplace=True)
     top20 = importance_df.head(20).reset_index(drop=True)
 
+    proba = baseline.predict_proba(X_test)
+    if proba.ndim == 1:
+        pos_scores = proba
+    elif proba.shape[1] == 1:
+        pos_scores = proba[:, 0]
+    else:
+        classes = list(baseline.named_steps["classifier"].classes_)
+        positive_index = 1 if len(classes) > 1 else 0
+        for candidate in ("1", 1, "fraud", "Fraud", True):
+            if candidate in classes:
+                positive_index = classes.index(candidate)
+                break
+        if len(classes) == 2:
+            pos_scores = proba[:, positive_index]
+        else:
+            pos_scores = proba.max(axis=1)
+
+    fraud_scores = pd.Series(pos_scores * 100.0, name="fraud_score")
+    predictions_raw = pd.Series(baseline.predict(X_test))
+    predictions_numeric = pd.to_numeric(predictions_raw, errors="coerce")
+    if predictions_numeric.notna().all():
+        predictions_col = predictions_numeric.round().astype(int)
+    else:
+        predictions_col = predictions_raw
+
+    actual_series = pd.Series(y_test).reset_index(drop=True)
+    predictions_col = predictions_col.reset_index(drop=True)
+    fraud_scores = fraud_scores.reset_index(drop=True)
+
+    predictions_df = pd.DataFrame(
+        {
+            "fraud_score": fraud_scores,
+            "prediction": predictions_col,
+            "actual": actual_series,
+        }
+    )
+    predictions_df.sort_values("fraud_score", ascending=False, inplace=True)
+    predictions_display = predictions_df.head(50).reset_index(drop=True)
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_model_"))
     model_path = tmp_dir / "baseline_model.joblib"
     metrics_path = tmp_dir / "metrics.json"
     importance_path = tmp_dir / "feature_importance.csv"
     plot_path = tmp_dir / "feature_importance.png"
+    predictions_path = tmp_dir / "predictions.csv"
 
     joblib.dump(baseline, model_path)
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     importance_df.to_csv(importance_path, index=False)
+    predictions_df.to_csv(predictions_path, index=False)
 
     plot_image = None
     if not top20.empty:
@@ -377,6 +418,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "metrics_path": str(metrics_path),
             "importance_path": str(importance_path),
             "importance_plot": plot_image,
+            "predictions_path": str(predictions_path),
         }
     )
 
@@ -384,6 +426,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         "model_path": str(model_path),
         "metrics_path": str(metrics_path),
         "importance_path": str(importance_path),
+        "predictions_path": str(predictions_path),
         "recall": metrics["recall"],
         "precision": metrics["precision"],
         "f2_score": metrics["f2_score"],
@@ -405,6 +448,8 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         top20,
         plot_image,
         str(importance_path),
+        predictions_display,
+        str(predictions_path),
         state,
     )
 
@@ -461,6 +506,8 @@ def build_interface() -> gr.Blocks:
         importance_table = gr.Dataframe(label="Feature Importanzen (Top 20)", interactive=False)
         importance_plot = gr.Image(label="Feature Importance Chart", interactive=False)
         importance_download = gr.File(label="Feature Importances CSV", interactive=False)
+        predictions_table = gr.Dataframe(label="Predictions (Test Set, sortiert nach Risiko)", interactive=False)
+        predictions_download = gr.File(label="Predictions CSV", interactive=False)
 
         load_btn.click(
             load_dataset,
@@ -492,6 +539,8 @@ def build_interface() -> gr.Blocks:
                 importance_table,
                 importance_plot,
                 importance_download,
+                predictions_table,
+                predictions_download,
                 state,
             ],
         )
