@@ -11,7 +11,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import balanced_accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.metrics import (balanced_accuracy_score, classification_report,
+                             confusion_matrix, f1_score, precision_score,
+                             recall_score, fbeta_score)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
@@ -326,6 +328,9 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     y_pred = baseline.predict(X_test)
 
     metrics = {
+        "recall": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
+        "precision": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
+        "f2_score": float(fbeta_score(y_test, y_pred, average="macro", beta=2.0, zero_division=0)),
         "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
         "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
         "classification_report": classification_report(y_test, y_pred, zero_division=0),
@@ -375,17 +380,20 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         }
     )
 
+    metric_summary = {
+        "model_path": str(model_path),
+        "metrics_path": str(metrics_path),
+        "importance_path": str(importance_path),
+        "recall": metrics["recall"],
+        "precision": metrics["precision"],
+        "f2_score": metrics["f2_score"],
+        "balanced_accuracy": metrics["balanced_accuracy"],
+        "macro_f1": metrics["macro_f1"],
+    }
+
     logger.info(
         "ui_baseline_trained",
-        **mask_sensitive_data(
-            {
-                "model_path": str(model_path),
-                "metrics_path": str(metrics_path),
-                "importance_path": str(importance_path),
-                "balanced_accuracy": metrics["balanced_accuracy"],
-                "macro_f1": metrics["macro_f1"],
-            }
-        ),
+        **mask_sensitive_data(metric_summary),
     )
 
     return (

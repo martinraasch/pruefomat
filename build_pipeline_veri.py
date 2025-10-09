@@ -21,7 +21,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (balanced_accuracy_score, classification_report,
-                             confusion_matrix, f1_score)
+                             confusion_matrix, f1_score, precision_score,
+                             recall_score, fbeta_score)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -494,6 +495,9 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
         y_pred = baseline_model.predict(X_test)
 
         metrics = {
+            "recall": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
+            "precision": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
+            "f2_score": float(fbeta_score(y_test, y_pred, average="macro", beta=2.0, zero_division=0)),
             "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
             "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
             "classification_report": classification_report(y_test, y_pred, zero_division=0),
@@ -542,9 +546,17 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
         if plot_path:
             profile["feature_importance_plot"] = str(plot_path)
 
+        metric_summary = {
+            "recall": metrics["recall"],
+            "precision": metrics["precision"],
+            "f2_score": metrics["f2_score"],
+            "balanced_accuracy": metrics["balanced_accuracy"],
+            "macro_f1": metrics["macro_f1"],
+        }
+
         logger.info(
             "baseline_trained",
-            metrics=mask_sensitive_data({"balanced_accuracy": metrics["balanced_accuracy"], "macro_f1": metrics["macro_f1"]}),
+            metrics=mask_sensitive_data(metric_summary),
             model_path=str(model_path),
             metrics_path=str(metrics_path),
             feature_importance_csv=str(importance_csv),
