@@ -1,0 +1,36 @@
+columns:
+  Land:
+    type: categorical
+  BUK:
+    type: categorical
+  "DEB Name":
+    type: text
+  Rechnungsnummer:
+    type: categorical
+  Belegdatum:
+    type: date
+  Betrag:
+    type: money
+  "Fällig":
+    type: date
+  Debitor:
+    type: categorical
+  Ampel:
+    type: ordinal
+  "Maßnahme 2025":
+    type: text
+  Hinweise:
+    type: text
+  "Rückmeldung erhalten":
+    type: flag
+  negativ:
+    type: flag
+options:
+  dayfirst: true
+  currency_symbols:
+    - "€"
+    - "EUR"
+    - " "
+label:
+  name: Ampel
+  positive_if: ">=2"

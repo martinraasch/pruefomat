@@ -1,7 +1,9 @@
+import numpy as np
 import pandas as pd
 import pytest
 
 from build_pipeline_veri import safe_amount, parse_date_series, DataFramePreparer
+from eval_utils import precision_recall_at_k, compute_cost_simulation
 
 
 def test_safe_amount_parsing_handles_locales():
@@ -37,3 +39,18 @@ def test_dataframe_preparer_drops_empty_columns():
     assert "EmptyCol" not in prepared.columns
     assert "Betrag_parsed" in prepared.columns
     assert "tage_bis_faellig" not in prepared.columns
+
+
+def test_precision_recall_at_k_small_sample():
+    y_true = np.array([1, 0, 1, 0, 1])
+    scores = np.array([0.9, 0.8, 0.7, 0.6, 0.1])
+    prec, rec = precision_recall_at_k(y_true, scores, 0.4)
+    assert pytest.approx(prec, rel=1e-6) == 1.0
+    assert pytest.approx(rec, rel=1e-6) == 2 / 3
+
+
+def test_cost_simulation_behaviour():
+    y_true = np.array([1, 0, 1, 0, 1])
+    scores = np.array([0.9, 0.2, 0.8, 0.3, 0.1])
+    benefit = compute_cost_simulation(y_true, scores, 0.4, cost_review=10, cost_miss=100)
+    assert benefit > 0
