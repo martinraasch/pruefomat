@@ -35,6 +35,10 @@ from build_pipeline_veri import (
 from logging_utils import configure_logging, get_logger, mask_sensitive_data
 
 
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("GRADIO_DO_NOT_TRACK", "True")
+os.environ.setdefault("GRADIO_DISABLE_USAGE_STATS", "True")
+
 configure_logging()
 logger = get_logger(__name__)
 
@@ -943,7 +947,7 @@ def build_interface() -> gr.Blocks:
 
 def main():
     demo = build_interface()
-    demo.launch()
+    demo.launch(share=False, analytics_enabled=False, show_error=True)
 
 
 if __name__ == "__main__":
