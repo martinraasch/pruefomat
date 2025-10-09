@@ -10,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import shap
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (balanced_accuracy_score, classification_report,
                              confusion_matrix, f1_score, precision_score,
@@ -419,8 +420,17 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "importance_path": str(importance_path),
             "importance_plot": plot_image,
             "predictions_path": str(predictions_path),
+            "shap_feature_names": list(feature_names),
         }
     )
+
+    try:
+        background_size = min(200, len(df_features))
+        background = baseline.named_steps["preprocessor"].transform(df_features.head(background_size))
+        background_dense = background.toarray() if hasattr(background, "toarray") else background
+        state["shap_background"] = background_dense
+    except Exception as exc:
+        logger.warning("ui_shap_background_failed", message=str(exc))
 
     metric_summary = {
         "model_path": str(model_path),
@@ -452,6 +462,86 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         str(predictions_path),
         state,
     )
+
+
+def explain_prediction_action(state: Optional[Dict[str, Any]], row_index):
+    state = state or {}
+    baseline = state.get("baseline_model")
+    df_features = state.get("df_features")
+    if baseline is None or df_features is None:
+        return "Bitte zuerst Baseline trainieren.", None, None, state
+
+    try:
+        idx = int(row_index)
+    except (TypeError, ValueError):
+        return "Ungültiger Index.", None, None, state
+
+    if idx < 0 or idx >= len(df_features):
+        return f"Index muss zwischen 0 und {len(df_features)-1} liegen.", None, None, state
+
+    preprocessor = baseline.named_steps.get("preprocessor")
+    classifier = baseline.named_steps.get("classifier")
+    if preprocessor is None or classifier is None:
+        return "Pipeline unvollständig.", None, None, state
+
+    if not hasattr(classifier, "estimators_"):
+        return "Erklärungen unterstützen derzeit nur Baum-Modelle (z. B. RandomForest).", None, None, state
+
+    feature_names = state.get("shap_feature_names")
+    if feature_names is None:
+        try:
+            feature_names = preprocessor.get_feature_names_out().tolist()
+        except Exception:
+            transformed = preprocessor.transform(df_features.head(1))
+            feature_names = [f"f_{i}" for i in range(transformed.shape[1])]
+        state["shap_feature_names"] = feature_names
+
+    sample = df_features.iloc[[idx]]
+    transformed = preprocessor.transform(sample)
+    transformed_dense = transformed.toarray() if hasattr(transformed, "toarray") else transformed
+
+    background = state.get("shap_background")
+    if background is None:
+        bg = preprocessor.transform(df_features.head(min(200, len(df_features))))
+        background = bg.toarray() if hasattr(bg, "toarray") else bg
+        state["shap_background"] = background
+
+    try:
+        explainer = shap.TreeExplainer(classifier, background)
+        shap_values = explainer.shap_values(transformed_dense)
+        if isinstance(shap_values, list):
+            classes = list(getattr(classifier, "classes_", [0, 1]))
+            pos_idx = 1 if len(classes) > 1 else 0
+            for candidate in ("1", 1, True, "fraud", "Fraud"):
+                if candidate in classes:
+                    pos_idx = classes.index(candidate)
+                    break
+            shap_row = shap_values[pos_idx][0]
+        else:
+            shap_row = shap_values[0]
+    except Exception as exc:
+        logger.error("ui_shap_failed", message=str(exc))
+        return f"SHAP konnte nicht berechnet werden: {exc}", None, None, state
+
+    feature_array = np.array(feature_names)
+    values_array = transformed_dense[0]
+    order = np.argsort(np.abs(shap_row))[::-1][:5]
+    explanation = []
+    for i in order:
+        explanation.append(
+            {
+                "feature": feature_array[i],
+                "shap_value": float(shap_row[i]),
+                "feature_value": float(values_array[i]),
+                "impact": "erhöht Risiko" if shap_row[i] >= 0 else "senkt Risiko",
+            }
+        )
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_shap_"))
+    json_path = tmp_dir / "explanation.json"
+    json_path.write_text(json.dumps(explanation, indent=2), encoding="utf-8")
+
+    return f"Top-Features für Zeile {idx}", explanation, str(json_path), state
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +598,11 @@ def build_interface() -> gr.Blocks:
         importance_download = gr.File(label="Feature Importances CSV", interactive=False)
         predictions_table = gr.Dataframe(label="Predictions (Test Set, sortiert nach Risiko)", interactive=False)
         predictions_download = gr.File(label="Predictions CSV", interactive=False)
+        explain_index = gr.Number(label="Zeilenindex für Erklärung", value=0, precision=0)
+        explain_btn = gr.Button("Erklärung anzeigen")
+        explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
+        explain_json = gr.JSON(label="Top-Features (SHAP)")
+        explain_download = gr.File(label="Erklärungs-JSON", interactive=False)
 
         load_btn.click(
             load_dataset,
@@ -543,6 +638,12 @@ def build_interface() -> gr.Blocks:
                 predictions_download,
                 state,
             ],
+        )
+
+        explain_btn.click(
+            explain_prediction_action,
+            inputs=[state, explain_index],
+            outputs=[explain_status, explain_json, explain_download, state],
         )
 
     return demo
