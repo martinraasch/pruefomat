@@ -9,9 +9,13 @@ import shap
 from app import (
     DEFAULT_CONFIG,
     DEFAULT_CONFIG_PATH,
-    train_baseline_action,
-    explain_prediction_action,
+    FEEDBACK_DB_PATH,
     batch_predict_action,
+    explain_prediction_action,
+    feedback_fp_action,
+    feedback_report_action,
+    feedback_tp_action,
+    train_baseline_action,
 )
 
 
@@ -72,6 +76,13 @@ def baseline_state():
     return metrics, predictions, updated_state
 
 
+@pytest.fixture
+def feedback_db(monkeypatch, tmp_path):
+    path = tmp_path / "feedback.db"
+    monkeypatch.setattr("app.FEEDBACK_DB_PATH", path)
+    return path
+
+
 def test_recall_metrics(baseline_state):
     metrics, _, _ = baseline_state
     assert "recall" in metrics
@@ -111,3 +122,14 @@ def test_batch_prediction(tmp_path, baseline_state):
     out_df = pd.read_excel(download_path)
     assert "fraud_score" in out_df.columns
     assert "prediction" in out_df.columns
+
+
+def test_feedback_flow(baseline_state, feedback_db):
+    _, predictions, state = baseline_state
+    status, state = feedback_tp_action(state, predictions.iloc[0]["row_index"], "alice", "korrekt")
+    assert "gespeichert" in status
+    status_fp, state = feedback_fp_action(state, predictions.iloc[1]["row_index"], "alice", "falsch")
+    assert "gespeichert" in status_fp
+    report_status, report_text, report_path, _ = feedback_report_action(state)
+    assert isinstance(report_status, str)
+    assert Path(report_path).exists()

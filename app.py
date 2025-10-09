@@ -1,7 +1,10 @@
 """Gradio interface for the pruefomat Veri pipeline builder."""
 
 import json
+import os
+import sqlite3
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -34,6 +37,29 @@ from logging_utils import configure_logging, get_logger, mask_sensitive_data
 
 configure_logging()
 logger = get_logger(__name__)
+
+FEEDBACK_DB_PATH = Path(json.loads(os.environ.get("PRUEFOMAT_SETTINGS", "{}")).get("feedback_db", "feedback.db"))
+
+
+def ensure_feedback_db():
+    FEEDBACK_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(FEEDBACK_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                beleg_index INTEGER,
+                beleg_id TEXT,
+                timestamp TEXT,
+                user TEXT,
+                score REAL,
+                prediction INTEGER,
+                feedback TEXT,
+                comment TEXT
+            )
+            """
+        )
+        conn.commit()
 
 # ---------------------------------------------------------------------------
 # Configuration setup
@@ -381,6 +407,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
 
     predictions_df = pd.DataFrame(
         {
+            "row_index": np.arange(len(fraud_scores)),
             "fraud_score": fraud_scores,
             "prediction": predictions_col,
             "actual": actual_series,
@@ -422,6 +449,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "predictions_path": str(predictions_path),
             "shap_feature_names": list(feature_names),
             "feature_importances": importance_df.to_dict(orient="records"),
+            "predictions_full": predictions_df,
         }
     )
 
@@ -660,6 +688,105 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     return "Batch abgeschlossen.", str(out_path)
 
 
+def record_feedback(state: Dict[str, Any], row_index: int, feedback: str, user: str, comment: str) -> str:
+    ensure_feedback_db()
+    predictions = state.get("predictions_full")
+    df_features = state.get("df_features")
+    if predictions is None or df_features is None:
+        return "Keine Predictions verfügbar."
+
+    if row_index < 0 or row_index >= len(predictions):
+        return "Index außerhalb gültiger Grenzen."
+
+    row = predictions.iloc[row_index]
+    df_row = df_features.iloc[row_index]
+    beleg_id = df_row.get("Rechnungsnummer") if isinstance(df_row, pd.Series) else None
+
+    with sqlite3.connect(FEEDBACK_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO feedback (beleg_index, beleg_id, timestamp, user, score, prediction, feedback, comment)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(row_index),
+                None if pd.isna(beleg_id) else str(beleg_id),
+                datetime.utcnow().isoformat(),
+                user or "unknown",
+                float(row["fraud_score"]),
+                int(row["prediction"]),
+                feedback,
+                comment or "",
+            ),
+        )
+        conn.commit()
+
+    return "Feedback gespeichert."
+
+
+def feedback_action(state: Optional[Dict[str, Any]], row_index, user, comment, label):
+    state = state or {}
+    try:
+        idx = int(row_index)
+    except (TypeError, ValueError):
+        return "Ungültiger Index.", state
+
+    message = record_feedback(state, idx, label, user or "unknown", comment)
+    return message, state
+
+
+def feedback_report_action(state: Optional[Dict[str, Any]]):
+    ensure_feedback_db()
+    with sqlite3.connect(FEEDBACK_DB_PATH) as conn:
+        df = pd.read_sql_query("SELECT * FROM feedback", conn, parse_dates=["timestamp"]) if conn else pd.DataFrame()
+
+    if df.empty:
+        return "Noch kein Feedback vorhanden.", "", state
+
+    now = datetime.utcnow()
+    last_week = now - timedelta(days=7)
+    df_week = df[df["timestamp"] >= last_week.isoformat()]
+    if df_week.empty:
+        summary = "Keine Feedback-Daten in den letzten 7 Tagen."
+    else:
+        tp = (df_week["feedback"] == "TP").sum()
+        fp = (df_week["feedback"] == "FP").sum()
+        total = tp + fp
+        precision = tp / total if total else float("nan")
+        false_positive_rate = fp / total if total else float("nan")
+        summary = (
+            f"Letzte Woche: Präzision {precision:.2%}, False Positive Rate {false_positive_rate:.2%}"
+            if total
+            else "Keine validen Feedback-Daten für letzte Woche."
+        )
+
+    overall_tp = (df["feedback"] == "TP").sum()
+    overall_fp = (df["feedback"] == "FP").sum()
+    overall_total = overall_tp + overall_fp
+    overall_precision = overall_tp / overall_total if overall_total else float("nan")
+
+    report_lines = ["# Feedback-Report", ""]
+    report_lines.append(summary)
+    report_lines.append("")
+    report_lines.append(f"Gesamt-Precision: {overall_precision:.2%}" if overall_total else "Gesamt-Precision: n/a")
+    report_lines.append(f"Anzahl Feedbacks: {overall_total}")
+
+    md_text = "\n".join(report_lines)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_feedback_"))
+    md_path = tmp_dir / "feedback_report.md"
+    md_path.write_text(md_text, encoding="utf-8")
+
+    return summary, md_text, str(md_path), state
+
+
+def feedback_tp_action(state, row_index, user, comment):
+    return feedback_action(state, row_index, user, comment, "TP")
+
+
+def feedback_fp_action(state, row_index, user, comment):
+    return feedback_action(state, row_index, user, comment, "FP")
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -722,6 +849,16 @@ def build_interface() -> gr.Blocks:
                 report_status = gr.Textbox(label="Report-Status", interactive=False)
                 report_preview = gr.Markdown(label="Report Vorschau")
                 report_download = gr.File(label="Report Download", interactive=False)
+                feedback_user = gr.Textbox(label="Prüfer:in", value="")
+                feedback_comment = gr.Textbox(label="Feedback-Kommentar", lines=2)
+                feedback_index = gr.Number(label="Zeilenindex (Feedback)", value=0, precision=0)
+                feedback_tp_btn = gr.Button("✅ True Positive")
+                feedback_fp_btn = gr.Button("❌ False Positive")
+                feedback_status = gr.Textbox(label="Feedback-Status", interactive=False)
+                feedback_report_btn = gr.Button("Feedback-Report")
+                feedback_report_status = gr.Textbox(label="Feedback-Report-Status", interactive=False)
+                feedback_report_preview = gr.Markdown(label="Feedback Report Vorschau")
+                feedback_report_download = gr.File(label="Feedback Report Download", interactive=False)
 
             with gr.Tab("Batch Prediction"):
                 batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
@@ -775,6 +912,24 @@ def build_interface() -> gr.Blocks:
             generate_pattern_report_action,
             inputs=[state],
             outputs=[report_status, report_preview, report_download, state],
+        )
+
+        feedback_tp_btn.click(
+            feedback_tp_action,
+            inputs=[state, feedback_index, feedback_user, feedback_comment],
+            outputs=[feedback_status, state],
+        )
+
+        feedback_fp_btn.click(
+            feedback_fp_action,
+            inputs=[state, feedback_index, feedback_user, feedback_comment],
+            outputs=[feedback_status, state],
+        )
+
+        feedback_report_btn.click(
+            feedback_report_action,
+            inputs=[state],
+            outputs=[feedback_report_status, feedback_report_preview, feedback_report_download, state],
         )
 
         batch_button.click(
