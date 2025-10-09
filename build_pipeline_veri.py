@@ -9,11 +9,12 @@ import unicodedata
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import joblib
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
@@ -24,6 +25,18 @@ from sklearn.metrics import (balanced_accuracy_score, classification_report,
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from config_loader import (
+    AppConfig,
+    ConfigError,
+    RandomForestConfig,
+    load_config,
+    normalize_config_columns,
+)
+from logging_utils import configure_logging, get_logger, mask_sensitive_data
+
+
+logger = get_logger(__name__)
 
 # =============================================================================
 # Helper functions
@@ -201,8 +214,9 @@ class SelectColumns(BaseEstimator, TransformerMixin):
 class TextConcatenator(BaseEstimator, TransformerMixin):
     """Concatenate multiple text columns into a single cleaned string per row."""
 
-    def __init__(self, separator: str = " ") -> None:
+    def __init__(self, separator: str = " ", output_feature: str = "text_concat") -> None:
         self.separator = separator
+        self.output_feature = output_feature
 
     def fit(self, X, y=None):  # noqa: D401
         return self
@@ -220,6 +234,9 @@ class TextConcatenator(BaseEstimator, TransformerMixin):
                     parts.append(text)
             combined.append(self.separator.join(parts))
         return np.asarray(combined, dtype=object)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray([self.output_feature])
 
 
 # =============================================================================
@@ -243,71 +260,95 @@ class FeaturePlan:
         return ordered
 
 
-def infer_feature_plan(df: pd.DataFrame) -> FeaturePlan:
-    numeric_candidates = ["Betrag_parsed", "tage_bis_faellig"]
-    categorical_candidates = ["Land", "BUK", "Debitor"]
-    text_candidates = ["DEB_Name", "Massnahme_2025", "Hinweise"]
+def infer_feature_plan(df: pd.DataFrame, config: AppConfig) -> FeaturePlan:
+    numeric: List[str] = []
+    if config.data.amount_col and "Betrag_parsed" in df.columns and df["Betrag_parsed"].notna().any():
+        numeric.append("Betrag_parsed")
+    if (
+        config.data.issue_col
+        and config.data.due_col
+        and "tage_bis_faellig" in df.columns
+        and df["tage_bis_faellig"].notna().any()
+    ):
+        numeric.append("tage_bis_faellig")
 
-    numeric = [col for col in numeric_candidates if col in df.columns and df[col].notna().any()]
-    categorical = [col for col in categorical_candidates if col in df.columns]
-    text = [col for col in text_candidates if col in df.columns]
+    for col in config.data.numeric_columns:
+        if col in df.columns and df[col].notna().any():
+            numeric.append(col)
+
+    categorical = [col for col in config.data.categorical_columns if col in df.columns]
+    text = [col for col in config.data.text_columns if col in df.columns]
 
     return FeaturePlan(numeric=numeric, categorical=categorical, text=text)
 
 
-def build_preprocessor(feature_plan: FeaturePlan) -> Pipeline:
-    numeric_pipeline = Pipeline(
-        steps=[
-            ("impute", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler(with_mean=False)),
-        ]
-    )
+def build_preprocessor(feature_plan: FeaturePlan, config: AppConfig) -> Pipeline:
+    transformers: List[tuple] = []
 
-    categorical_pipeline = Pipeline(
-        steps=[
-            ("impute", SimpleImputer(strategy="most_frequent")),
-            ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
-        ]
-    )
+    if feature_plan.numeric:
+        numeric_pipeline = Pipeline(
+            steps=[
+                ("impute", SimpleImputer(strategy="median")),
+                ("scale", StandardScaler(with_mean=False)),
+            ]
+        )
+        transformers.append(("num", numeric_pipeline, feature_plan.numeric))
 
-    text_pipeline = Pipeline(
-        steps=[
-            ("concat", TextConcatenator()),
-            (
-                "tfidf",
-                TfidfVectorizer(
-                    ngram_range=(1, 2),
-                    min_df=2,
-                    max_features=4000,
-                    dtype=np.float32,
+    if feature_plan.categorical:
+        categorical_pipeline = Pipeline(
+            steps=[
+                ("impute", SimpleImputer(strategy="most_frequent")),
+                ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
+            ]
+        )
+        transformers.append(("cat", categorical_pipeline, feature_plan.categorical))
+
+    if feature_plan.text:
+        text_pipeline = Pipeline(
+            steps=[
+                ("concat", TextConcatenator()),
+                (
+                    "tfidf",
+                    TfidfVectorizer(
+                        ngram_range=(1, config.preprocessing.tfidf_ngram_max),
+                        min_df=config.preprocessing.tfidf_min_df,
+                        max_features=config.preprocessing.tfidf_max_features,
+                        dtype=np.float32,
+                    ),
                 ),
-            ),
-        ]
-    )
+            ]
+        )
+        transformers.append(("text", text_pipeline, feature_plan.text))
 
     column_transformer = ColumnTransformer(
-        transformers=[
-            ("num", numeric_pipeline, feature_plan.numeric),
-            ("cat", categorical_pipeline, feature_plan.categorical),
-            ("text", text_pipeline, feature_plan.text),
-        ],
+        transformers=transformers,
         remainder="drop",
         sparse_threshold=0.3,
         verbose_feature_names_out=False,
     )
+
+    date_columns = config.data.additional_date_columns
+    null_like = list({*NULL_LIKE_DEFAULT, *config.data.null_like})
 
     pipeline = Pipeline(
         steps=[
             (
                 "prep_df",
                 DataFramePreparer(
-                    amount_col="Betrag",
-                    issue_col="Belegdatum",
-                    due_col="Faellig",
-                    date_columns=["Datum"],
+                    amount_col=config.data.amount_col or "",
+                    issue_col=config.data.issue_col or "",
+                    due_col=config.data.due_col or "",
+                    date_columns=date_columns,
+                    null_like=null_like,
                 ),
             ),
-            ("add_due_days", DaysUntilDueAdder(issue_col="Belegdatum", due_col="Faellig")),
+            (
+                "add_due_days",
+                DaysUntilDueAdder(
+                    issue_col=config.data.issue_col or "",
+                    due_col=config.data.due_col or "",
+                ),
+            ),
             ("select", SelectColumns(feature_plan.all)),
             ("encode", column_transformer),
         ]
@@ -331,6 +372,24 @@ def normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
 
 def run_pipeline_builder(args: argparse.Namespace) -> int:
+    config_path = Path(args.config) if args.config else None
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        logger.error("config_error", message=str(exc), config_path=str(config_path) if config_path else "default")
+        return 1
+
+    config = normalize_config_columns(config)
+
+    if args.target:
+        config.data.target_col = normalize_column_name(args.target)
+
+    logger.info(
+        "config_loaded",
+        config_path=str(config_path or Path("config/default_config.yaml")),
+        target_col=config.data.target_col,
+    )
+
     excel_path = Path(args.excel)
     if not excel_path.exists():
         raise FileNotFoundError(f"Excel file not found: {excel_path}")
@@ -339,57 +398,66 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
     df_raw = read_excel(excel_path, sheet)
     df_norm, column_mapping = normalize_columns(df_raw)
 
-    target_name = None
-    y = None
-    df_features = df_norm.copy()
-
-    if args.target:
-        normalized_target = normalize_column_name(args.target)
-        if normalized_target in df_norm.columns:
-            raw_target = pd.Series(df_norm[normalized_target], dtype="object")
-            target_clean = raw_target.astype("string").str.strip()
-            target_clean = target_clean.replace({"": pd.NA})
-            mask = target_clean.notna()
-            if mask.any():
-                target_name = normalized_target
-                y = target_clean.loc[mask].astype("string")
-                df_features = df_features.loc[mask]
-            else:
-                print(
-                    f"Warning: target column '{args.target}' exists but contains no labels after cleaning; baseline will be skipped.",
-                    file=sys.stderr,
-                )
-            df_features = df_features.drop(columns=[normalized_target])
-        else:
-            print(
-                f"Warning: target column '{args.target}' not found after normalization (expected '{normalized_target}').",
-                file=sys.stderr,
-            )
-    df_features = df_features.reset_index(drop=True)
-    if y is not None:
-        y = y.reset_index(drop=True)
-
-    preparer_preview = DataFramePreparer(
-        amount_col="Betrag",
-        issue_col="Belegdatum",
-        due_col="Faellig",
-        date_columns=["Datum"],
+    logger.info(
+        "excel_loaded",
+        file=str(excel_path),
+        sheet=sheet,
+        rows=len(df_norm),
+        columns=df_norm.shape[1],
     )
-    prepared = preparer_preview.fit_transform(df_features)
-    with_due = DaysUntilDueAdder(issue_col="Belegdatum", due_col="Faellig").fit_transform(prepared)
 
-    feature_plan = infer_feature_plan(with_due)
+    df_features = df_norm.copy()
+    y = None
+    target_name = config.data.target_col
 
-    preprocessor = build_preprocessor(feature_plan)
+    if target_name:
+        if target_name in df_norm.columns:
+            raw_target = df_norm[target_name].astype("string").str.strip()
+            raw_target = raw_target.replace({"": pd.NA})
+            mask = raw_target.notna()
+            if mask.any():
+                y = raw_target.loc[mask].reset_index(drop=True)
+                df_features = df_features.loc[mask].reset_index(drop=True)
+            else:
+                logger.warning("target_no_labels", target=target_name)
+            df_features = df_features.drop(columns=[target_name])
+        else:
+            logger.warning("target_missing", target=target_name)
+            target_name = None
+
+    preparer = DataFramePreparer(
+        amount_col=config.data.amount_col or "",
+        issue_col=config.data.issue_col or "",
+        due_col=config.data.due_col or "",
+        date_columns=config.data.additional_date_columns,
+        null_like=list({*NULL_LIKE_DEFAULT, *config.data.null_like}),
+    )
+    prepared = preparer.fit_transform(df_features)
+    with_due = DaysUntilDueAdder(
+        issue_col=config.data.issue_col or "",
+        due_col=config.data.due_col or "",
+    ).fit_transform(prepared)
+
+    feature_plan = infer_feature_plan(with_due, config)
+
+    logger.info(
+        "feature_plan_created",
+        numeric=len(feature_plan.numeric),
+        categorical=len(feature_plan.categorical),
+        text=len(feature_plan.text),
+    )
+
+    preprocessor = build_preprocessor(feature_plan, config)
     preprocessor.fit(df_features)
 
     prep_out = Path(args.prep_out)
     ensure_directory(prep_out)
     joblib.dump(preprocessor, prep_out)
 
-    profile = {
+    profile: Dict[str, Any] = {
         "input_excel": str(excel_path),
         "sheet": sheet,
+        "config_file": str(config_path or Path("config/default_config.yaml")),
         "column_mapping": column_mapping,
         "feature_plan": {
             "numeric": feature_plan.numeric,
@@ -409,22 +477,16 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
             df_features,
             y,
             test_size=0.2,
-            random_state=42,
+            random_state=config.model.random_forest.random_state,
             stratify=stratify,
         )
 
+        rf_kwargs = config.model.random_forest.model_dump(exclude_none=True)
+
         baseline_model = Pipeline(
             steps=[
-                ("preprocessor", build_preprocessor(feature_plan)),
-                (
-                    "classifier",
-                    RandomForestClassifier(
-                        n_estimators=300,
-                        random_state=42,
-                        n_jobs=-1,
-                        class_weight="balanced",
-                    ),
-                ),
+                ("preprocessor", build_preprocessor(feature_plan, config)),
+                ("classifier", RandomForestClassifier(**rf_kwargs)),
             ]
         )
 
@@ -438,6 +500,34 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
             "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
         }
 
+        encoder = baseline_model.named_steps["preprocessor"].named_steps.get("encode")
+        if encoder is not None and hasattr(encoder, "get_feature_names_out"):
+            feature_names = encoder.get_feature_names_out()
+        else:
+            feature_names = np.array([f"f_{i}" for i in range(len(baseline_model.named_steps["classifier"].feature_importances_))])
+
+        importance = baseline_model.named_steps["classifier"].feature_importances_
+        importance_df = pd.DataFrame({"feature": feature_names, "importance": importance})
+        importance_df.sort_values("importance", ascending=False, inplace=True)
+
+        importance_csv = Path(args.feature_importance_csv)
+        ensure_directory(importance_csv)
+        importance_df.to_csv(importance_csv, index=False)
+
+        top20 = importance_df.head(20)
+        if not top20.empty:
+            plt.figure(figsize=(10, 6))
+            plt.barh(top20["feature"][::-1], top20["importance"][::-1], color="#2b8a3e")
+            plt.xlabel("Importance")
+            plt.title("Top 20 Feature Importances")
+            plt.tight_layout()
+            plot_path = Path(args.feature_importance_plot)
+            ensure_directory(plot_path)
+            plt.savefig(plot_path, dpi=150)
+            plt.close()
+        else:
+            plot_path = None
+
         model_path = Path(args.model_out)
         ensure_directory(model_path)
         joblib.dump(baseline_model, model_path)
@@ -448,23 +538,36 @@ def run_pipeline_builder(args: argparse.Namespace) -> int:
 
         profile["baseline_model"] = str(model_path)
         profile["metrics_file"] = str(metrics_path)
+        profile["feature_importance_csv"] = str(importance_csv)
+        if plot_path:
+            profile["feature_importance_plot"] = str(plot_path)
 
-    elif target_name:
-        print(
-            "Warning: Target available but only a single class after cleaning; baseline model skipped.",
-            file=sys.stderr,
+        logger.info(
+            "baseline_trained",
+            metrics=mask_sensitive_data({"balanced_accuracy": metrics["balanced_accuracy"], "macro_f1": metrics["macro_f1"]}),
+            model_path=str(model_path),
+            metrics_path=str(metrics_path),
+            feature_importance_csv=str(importance_csv),
+            feature_importance_plot=str(plot_path) if plot_path else None,
         )
+    elif target_name:
+        logger.warning("baseline_skipped_single_class", target=target_name)
 
     profile_path = Path(args.report_out)
     ensure_directory(profile_path)
     profile_path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
 
-    print(f"Saved preprocessor to {prep_out}")
-    if model_path:
-        print(f"Saved baseline model to {model_path}")
-    if metrics_path:
-        print(f"Saved metrics to {metrics_path}")
-    print(f"Profile written to {profile_path}")
+    logger.info(
+        "artifacts_written",
+        **mask_sensitive_data(
+            {
+                "prep_path": str(prep_out),
+                "model_path": str(model_path) if model_path else None,
+                "metrics_path": str(metrics_path) if metrics_path else None,
+                "profile_path": str(profile_path),
+            }
+        ),
+    )
     return 0
 
 
@@ -472,17 +575,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build Veri preprocessing pipeline")
     parser.add_argument("--excel", required=True, help="Path to Excel file with Veri data")
     parser.add_argument("--sheet", default="0", help="Sheet name or index")
-    parser.add_argument("--target", default=None, help="Target column for baseline training")
+    parser.add_argument("--config", default=None, help="Path to configuration file (YAML or JSON)")
+    parser.add_argument("--target", default=None, help="Override target column for baseline training")
     parser.add_argument("--prep-out", default="outputs/prep_pipeline.joblib", help="Path to save preprocessing pipeline")
     parser.add_argument("--model-out", default="outputs/model.joblib", help="Path to save baseline model")
     parser.add_argument("--metrics-out", default="outputs/metrics.json", help="Path to save baseline metrics")
     parser.add_argument("--report-out", default="outputs/profile.json", help="Path to save profile report")
+    parser.add_argument("--feature-importance-csv", default="outputs/feature_importance.csv", help="Path to save feature importances (CSV)")
+    parser.add_argument("--feature-importance-plot", default="outputs/feature_importance.png", help="Path to save feature importance chart (PNG)")
+    parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    configure_logging(args.log_level)
     return run_pipeline_builder(args)
 
 

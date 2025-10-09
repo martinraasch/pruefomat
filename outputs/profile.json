@@ -1,6 +1,7 @@
 {
   "input_excel": "data/Veri-Bsp.xlsx",
   "sheet": 0,
+  "config_file": "config/default_config.yaml",
   "column_mapping": {
     "Land": "Land",
     "Zahlbetr.": "Zahlbetr",
@@ -44,5 +45,7 @@
     "Ticket_nummer"
   ],
   "baseline_model": "outputs/model.joblib",
-  "metrics_file": "outputs/metrics.json"
+  "metrics_file": "outputs/metrics.json",
+  "feature_importance_csv": "outputs/feature_importance.csv",
+  "feature_importance_plot": "outputs/feature_importance.png"
 }

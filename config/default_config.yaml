@@ -1,0 +1,38 @@
+data:
+  amount_col: "Betrag"
+  issue_col: "Belegdatum"
+  due_col: "Faellig"
+  additional_date_columns:
+    - "Datum"
+  numeric_columns: []
+  categorical_columns:
+    - "Land"
+    - "BUK"
+    - "Debitor"
+  text_columns:
+    - "DEB_Name"
+    - "Massnahme_2025"
+    - "Hinweise"
+  target_col: "Ampel"
+  null_like:
+    - ""
+    - " "
+    - "-"
+    - "_"
+    - "n/a"
+    - "na"
+    - "nan"
+    - "None"
+
+preprocessing:
+  tfidf_max_features: 4000
+  tfidf_min_df: 2
+  tfidf_ngram_max: 2
+
+model:
+  type: "random_forest"
+  random_forest:
+    n_estimators: 300
+    class_weight: "balanced"
+    random_state: 42
+    n_jobs: -1
