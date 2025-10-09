@@ -197,10 +197,17 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, state
     df_features = df_norm
     target_msg = "Keine Zielspalte gesetzt."
     if target_norm and target_norm in df_norm.columns:
-        target_series = df_norm[target_norm]
-        df_features = df_norm.drop(columns=[target_norm])
-        target_msg = f"Zielspalte erkannt: {target_norm}"
-        logger.info("ui_target_detected", target=target_norm)
+        target_numeric = pd.to_numeric(df_norm[target_norm], errors="coerce")
+        mask = target_numeric.notna()
+        if mask.any():
+            target_series = target_numeric.loc[mask].astype(int)
+            df_features = df_norm.loc[mask].drop(columns=[target_norm])
+            target_msg = f"Zielspalte erkannt: {target_norm}"
+            logger.info("ui_target_detected", target=target_norm)
+        else:
+            target_msg = f"Zielspalte '{target_norm}' enthält keine nutzbaren Werte."
+            df_features = df_norm.drop(columns=[target_norm])
+            logger.warning("ui_target_empty", target=target_norm)
     elif target_norm:
         target_msg = f"Warnung: Zielspalte '{target_norm}' nicht gefunden."
         logger.warning("ui_target_missing", target=target_norm)
