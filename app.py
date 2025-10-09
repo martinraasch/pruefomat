@@ -577,8 +577,44 @@ def explain_prediction_action(state: Optional[Dict[str, Any]], row_index):
         logger.error("ui_shap_failed", message=str(exc))
         return f"SHAP konnte nicht berechnet werden: {exc}", None, None, state
 
-    feature_array = np.array(feature_names)
+    shap_row = np.asarray(shap_row)
+    if shap_row.ndim > 1:
+        shap_row = shap_row.reshape(-1)
+    try:
+        shap_row = shap_row.astype(float, copy=False)
+    except (TypeError, ValueError):
+        flattened = []
+        for val in np.asarray(shap_row, dtype=object).ravel():
+            arr = np.asarray(val)
+            if arr.size == 0:
+                continue
+            flattened.extend(arr.astype(float, copy=False).ravel().tolist())
+        shap_row = np.array(flattened, dtype=float)
+
     values_array = transformed_dense[0]
+    values_array = np.asarray(values_array)
+    if values_array.ndim > 1:
+        values_array = values_array.reshape(-1)
+    values_array = values_array.astype(float, copy=False)
+
+    feature_array = np.asarray(feature_names, dtype=str)
+    lengths = (len(feature_array), shap_row.size, values_array.size)
+    if len(set(lengths)) != 1:
+        min_len = min(lengths)
+        logger.warning(
+            "ui_shap_length_mismatch",
+            feature_count=len(feature_array),
+            shap_len=shap_row.size,
+            value_len=values_array.size,
+            truncated_to=min_len,
+        )
+        feature_array = feature_array[:min_len]
+        shap_row = shap_row[:min_len]
+        values_array = values_array[:min_len]
+
+    if shap_row.size == 0:
+        return "Keine SHAP-Werte für diese Zeile verfügbar.", None, None, state
+
     order = np.argsort(np.abs(shap_row))[::-1][:5]
     explanation = []
     for i in order:

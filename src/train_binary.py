@@ -32,9 +32,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from eval_utils import (compute_cost_simulation, plot_lift_chart,
-                        plot_precision_at_k, plot_precision_recall, pr_curve,
-                        precision_recall_at_k)
+from .eval_utils import (compute_cost_simulation, plot_lift_chart,
+                         plot_precision_at_k, plot_precision_recall, pr_curve,
+                         precision_recall_at_k)
 
 sns.set_theme(style="whitegrid")
 
@@ -254,7 +254,7 @@ class TopNCategories(BaseEstimator, TransformerMixin):
         for col in self.columns_:
             top = set(self.categories_.get(col, []))
             df[col] = df[col].astype(str).where(df[col].astype(str).isin(top), self.other_label)
-        return df.values
+        return df
 
     def get_feature_names_out(self, input_features=None):
         return np.asarray(self.columns_)
@@ -397,7 +397,7 @@ def engineer_features(df: pd.DataFrame, schema: Schema) -> Tuple[pd.DataFrame, p
         df["tage_bis_faellig"] = np.nan
     df["ist_ueberfaellig"] = (df["tage_bis_faellig"].fillna(0) < 0).astype(int)
 
-    text_cols = [col for col, meta in schema.columns.items() if meta.get("type") == "text"]
+    text_cols = [col for col, meta in schema.columns.items() if meta.get("type") == "text" and col in df.columns]
     notes = (
         df[text_cols]
         .fillna("")
@@ -411,15 +411,22 @@ def engineer_features(df: pd.DataFrame, schema: Schema) -> Tuple[pd.DataFrame, p
     return feature_df, y
 
 
-def build_preprocessor(schema: Schema, top_n: int, min_frequency: float) -> Tuple[ColumnTransformer, List[str], List[str], List[str]]:
-    numeric_cols = ["Betrag_parsed", "betrag_log", "tage_bis_faellig", "ist_ueberfaellig"]
-    flag_cols = [col for col, meta in schema.columns.items() if meta.get("type") == "flag"]
-    numeric_cols.extend(flag_cols)
+def build_preprocessor(
+    schema: Schema,
+    top_n: int,
+    min_frequency: float,
+    available_columns: Iterable[str],
+) -> Tuple[ColumnTransformer, List[str], List[str], List[str]]:
+    available_set = set(str(col) for col in available_columns)
+    numeric_candidates = ["Betrag_parsed", "betrag_log", "tage_bis_faellig", "ist_ueberfaellig"]
+    flag_cols = [str(col) for col, meta in schema.columns.items() if meta.get("type") == "flag"]
+    numeric_cols = [col for col in numeric_candidates + flag_cols if col in available_set]
     numeric_cols = list(dict.fromkeys(numeric_cols))
-    cat_cols = [col for col, meta in schema.columns.items() if meta.get("type") == "categorical"]
+
+    cat_cols = [str(col) for col, meta in schema.columns.items() if meta.get("type") == "categorical" and str(col) in available_set]
     cat_cols = list(dict.fromkeys(cat_cols))
-    cat_cols = [col for col in cat_cols if col in schema.columns]
-    text_cols = ["notes_text"]
+
+    text_cols = ["notes_text"] if "notes_text" in available_set else []
 
     numeric_pipeline = Pipeline(
         steps=[
@@ -518,23 +525,25 @@ def evaluate_fold(
     cost_miss: float,
     budget_fraction: float,
 ) -> Tuple[str, FoldResult, Dict[str, Dict[str, float]]]:
+    y_val_array = np.asarray(y_val)
+    y_train_array = np.asarray(y_train)
     candidate_metrics: Dict[str, Dict[str, float]] = {}
     best_name = None
     best_pr_auc = -np.inf
     for name, clf in classifiers.items():
         pipeline = Pipeline([("prep", clone(preprocessor)), ("clf", clone(clf))])
-        pipeline.fit(X_train, y_train)
+        pipeline.fit(X_train, y_train_array)
         val_scores = pipeline.predict_proba(X_val)[:, -1]
-        pr_auc = average_precision_score(y_val, val_scores)
-        roc_auc = roc_auc_score(y_val, val_scores)
+        pr_auc = average_precision_score(y_val_array, val_scores)
+        roc_auc = roc_auc_score(y_val_array, val_scores)
         preds = (val_scores >= 0.5).astype(int)
         metrics_dict = {
             "pr_auc": pr_auc,
             "roc_auc": roc_auc,
-            "recall": recall_score(y_val, preds, zero_division=0),
-            "precision": precision_score(y_val, preds, zero_division=0),
-            "f1": f1_score(y_val, preds, zero_division=0),
-            "balanced_accuracy": balanced_accuracy_score(y_val, preds),
+            "recall": recall_score(y_val_array, preds, zero_division=0),
+            "precision": precision_score(y_val_array, preds, zero_division=0),
+            "f1": f1_score(y_val_array, preds, zero_division=0),
+            "balanced_accuracy": balanced_accuracy_score(y_val_array, preds),
         }
         candidate_metrics[name] = metrics_dict
         if pr_auc > best_pr_auc:
@@ -545,32 +554,32 @@ def evaluate_fold(
     best_clf = clone(classifiers[best_name])
     calibrator = CalibratedClassifierCV(best_clf, method="isotonic", cv=3, n_jobs=-1)
     pipeline = Pipeline([("prep", clone(preprocessor)), ("calib", calibrator)])
-    pipeline.fit(X_train, y_train)
+    pipeline.fit(X_train, y_train_array)
     val_scores = pipeline.predict_proba(X_val)[:, -1]
     val_preds = (val_scores >= 0.5).astype(int)
 
     fold_metrics = {
-        "roc_auc": roc_auc_score(y_val, val_scores),
-        "pr_auc": average_precision_score(y_val, val_scores),
-        "recall": recall_score(y_val, val_preds, zero_division=0),
-        "precision": precision_score(y_val, val_preds, zero_division=0),
-        "f1": f1_score(y_val, val_preds, zero_division=0),
-        "balanced_accuracy": balanced_accuracy_score(y_val, val_preds),
+        "roc_auc": roc_auc_score(y_val_array, val_scores),
+        "pr_auc": average_precision_score(y_val_array, val_scores),
+        "recall": recall_score(y_val_array, val_preds, zero_division=0),
+        "precision": precision_score(y_val_array, val_preds, zero_division=0),
+        "f1": f1_score(y_val_array, val_preds, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_val_array, val_preds),
     }
-    base_rate = float(np.mean(y_val))
+    base_rate = float(np.mean(y_val_array))
     for k in top_ks:
-        prec_k, rec_k = precision_recall_at_k(y_val, val_scores, k)
+        prec_k, rec_k = precision_recall_at_k(y_val_array, val_scores, k)
         fold_metrics[f"precision@{int(k*100)}"] = prec_k
         fold_metrics[f"recall@{int(k*100)}"] = rec_k
         fold_metrics[f"lift@{int(k*100)}"] = (prec_k / base_rate) if base_rate > 0 else float("nan")
         fold_metrics[f"cost@{int(k*100)}"] = compute_cost_simulation(
-            y_val, val_scores, k, cost_review, cost_miss
+            y_val_array, val_scores, k, cost_review, cost_miss
         )
     fold_metrics["cost@budget"] = compute_cost_simulation(
-        y_val, val_scores, budget_fraction, cost_review, cost_miss
+        y_val_array, val_scores, budget_fraction, cost_review, cost_miss
     )
 
-    return best_name, FoldResult(metrics=fold_metrics, scores=val_scores, y_true=y_val), candidate_metrics
+    return best_name, FoldResult(metrics=fold_metrics, scores=val_scores, y_true=y_val_array), candidate_metrics
 
 
 def aggregate_metrics(fold_results: List[FoldResult]) -> Dict[str, Dict[str, float]]:
@@ -629,8 +638,9 @@ def main():
     features_df, y = engineer_features(df_parsed, schema)
 
     preprocessor, numeric_cols, cat_cols, text_cols = build_preprocessor(
-        schema, args.topn_categories, args.min_category_frequency
+        schema, args.topn_categories, args.min_category_frequency, features_df.columns
     )
+    preprocessor.fit(features_df, y)
 
     classifiers = prepare_classifiers(args.random_state)
     k_values = [float(x) for x in args.topk.split(",") if x]
@@ -677,7 +687,12 @@ def main():
     joblib.dump(preprocessor_final, outdir / "preprocessor.joblib")
     joblib.dump(wrapper, outdir / "model.joblib")
 
-    feature_names = np.array(preprocessor_final.get_feature_names_out())
+    try:
+        feature_names = np.array(preprocessor_final.get_feature_names_out())
+    except Exception as exc:
+        transformed_sample = preprocessor_final.transform(features_df.head(1))
+        width = transformed_sample.shape[1]
+        feature_names = np.array([f"f_{i}" for i in range(width)])
 
     full_scores = wrapper.predict_proba(features_df)[:, -1]
     full_preds = (full_scores >= 0.5).astype(int)

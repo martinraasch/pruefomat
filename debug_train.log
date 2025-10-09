@@ -1,0 +1,12 @@
+/opt/homebrew/Caskroom/miniconda/base/envs/pruefomat/lib/python3.11/site-packages/openpyxl/worksheet/_reader.py:329: UserWarning: Conditional Formatting extension is not supported and will be removed
+  warn(msg)
+/Users/mraasch/Library/CloudStorage/OneDrive-ChabuduoGmbH/Dokumente/10_Projekte/Brainpilot/KI-Workshops/S-Factoring/Hackathon/pruefomat/src/train_binary.py:338: UserWarning: Parsing dates in %Y-%m-%d %H:%M:%S format when dayfirst=True was specified. Pass `dayfirst=False` or specify a format to silence this warning.
+  parsed = pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
+/Users/mraasch/Library/CloudStorage/OneDrive-ChabuduoGmbH/Dokumente/10_Projekte/Brainpilot/KI-Workshops/S-Factoring/Hackathon/pruefomat/src/train_binary.py:338: UserWarning: Parsing dates in %Y-%m-%d %H:%M:%S format when dayfirst=True was specified. Pass `dayfirst=False` or specify a format to silence this warning.
+  parsed = pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
+Fold 1: best=rf PR-AUC=0.733
+Fold 2: best=rf PR-AUC=0.833
+Fold 3: best=logreg PR-AUC=0.667
+Fold 4: best=logreg PR-AUC=0.833
+Fold 5: best=rf PR-AUC=1.000
+{"metrics": "reports/B1/metrics.json", "model": "reports/B1/model.joblib", "preprocessor": "reports/B1/preprocessor.joblib", "predictions": "reports/B1/predictions.csv"}

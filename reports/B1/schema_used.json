@@ -1,0 +1,53 @@
+{
+  "schema": {
+    "Land": {
+      "type": "categorical"
+    },
+    "BUK": {
+      "type": "categorical"
+    },
+    "DEB Name": {
+      "type": "text"
+    },
+    "Rechnungsnummer": {
+      "type": "categorical"
+    },
+    "Belegdatum": {
+      "type": "date"
+    },
+    "Betrag": {
+      "type": "money"
+    },
+    "F\u00e4llig": {
+      "type": "date"
+    },
+    "Debitor": {
+      "type": "categorical"
+    },
+    "Ampel": {
+      "type": "ordinal"
+    },
+    "Ma\u00dfnahme 2025": {
+      "type": "text"
+    },
+    "Hinweise": {
+      "type": "text"
+    },
+    "R\u00fcckmeldung erhalten": {
+      "type": "flag"
+    },
+    "negativ": {
+      "type": "flag"
+    }
+  },
+  "options": {
+    "dayfirst": true,
+    "currency_symbols": [
+      "\u20ac",
+      "EUR",
+      " "
+    ]
+  },
+  "label": "Ampel",
+  "positive_rule": ">=2"
+}
