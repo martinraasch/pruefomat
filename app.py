@@ -274,9 +274,47 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
             target_msg = f"Zielspalte erkannt: {target_norm}"
             logger.info("ui_target_detected", target=target_norm)
         else:
-            target_msg = f"Zielspalte '{target_norm}' enthält keine nutzbaren Werte."
-            df_features = df_norm_all.drop(columns=[target_norm])
-            logger.warning("ui_target_empty", target=target_norm)
+            raw_strings = df_norm_all[target_norm].astype("string").str.strip()
+            raw_strings = raw_strings.replace({"": pd.NA})
+
+            def _encode_target_strings(series: pd.Series) -> tuple[pd.Series, Dict[str, int]]:
+                series = series.astype("string")
+                series = series.replace({"": pd.NA})
+                if series.notna().sum() == 0:
+                    return series.astype("Int64"), {}
+                known_map = {
+                    "grün": 1,
+                    "gruen": 1,
+                    "gelb": 2,
+                    "rot": 3,
+                }
+                lower = series.str.lower()
+                if lower.dropna().isin(known_map).all():
+                    mapped = lower.map(known_map).astype("Int64")
+                    mapping: Dict[str, int] = {}
+                    for value in series.dropna().unique():
+                        mapping[str(value)] = known_map[str(value).lower()]
+                    return mapped, mapping
+                valid = series.dropna()
+                codes, uniques = pd.factorize(valid, sort=True)
+                mapping = {str(cat): int(idx + 1) for idx, cat in enumerate(uniques)}
+                mapped = pd.Series(pd.NA, index=series.index, dtype="Int64")
+                mapped.loc[valid.index] = codes + 1
+                return mapped, mapping
+
+            encoded_series, mapping = _encode_target_strings(raw_strings)
+            mask_encoded = encoded_series.notna()
+            if mask_encoded.any():
+                target_series = encoded_series.loc[mask_encoded].astype(int)
+                df_features = df_norm_all.loc[mask_encoded].drop(columns=[target_norm])
+                target_msg = f"Zielspalte erkannt: {target_norm} (kategorisch)"
+                logger.info("ui_target_detected", target=target_norm)
+                if mapping:
+                    state["target_mapping"] = mapping
+            else:
+                target_msg = f"Zielspalte '{target_norm}' enthält keine nutzbaren Werte."
+                df_features = df_norm_all.drop(columns=[target_norm])
+                logger.warning("ui_target_empty", target=target_norm)
     elif target_norm:
         target_msg = f"Warnung: Zielspalte '{target_norm}' nicht gefunden."
         logger.warning("ui_target_missing", target=target_norm)
