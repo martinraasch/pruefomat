@@ -42,6 +42,8 @@ os.environ.setdefault("GRADIO_DISABLE_USAGE_STATS", "True")
 configure_logging()
 logger = get_logger(__name__)
 
+AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "negativ", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
+
 FEEDBACK_DB_PATH = Path(json.loads(os.environ.get("PRUEFOMAT_SETTINGS", "{}")).get("feedback_db", "feedback.db"))
 
 
@@ -141,6 +143,22 @@ def _reset_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
+def _build_config_overview(state: Dict[str, Any]) -> Dict[str, Any]:
+    config_path = state.get("config_path")
+    target_name = state.get("target_name")
+    selected = state.get("selected_columns") or []
+    overview: Dict[str, Any] = {
+        "config_path": config_path,
+        "target_col": target_name,
+        "selected_columns": selected,
+        "balance_classes": bool(state.get("balance_classes")),
+    }
+    mapping = state.get("target_mapping")
+    if mapping:
+        overview["target_mapping"] = mapping
+    return overview
+
+
 def _collect_excel_files(upload, folder_text: str | None) -> tuple[list[Path], list[str]]:
     paths: list[Path] = []
     warnings_list: list[str] = []
@@ -183,6 +201,32 @@ def _collect_excel_files(upload, folder_text: str | None) -> tuple[list[Path], l
             deduped.append(resolved)
             seen.add(resolved)
     return deduped, warnings_list
+
+
+def _balance_training_set(
+    X: pd.DataFrame,
+    y: pd.Series,
+    random_state: int | None = None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    if X.empty or y.empty:
+        return X, y
+    df = X.copy()
+    df["__target__"] = y.reset_index(drop=True)
+    counts = df["__target__"].value_counts()
+    max_count = counts.max()
+    rng = np.random.default_rng(random_state or 42)
+    balanced_parts = []
+    for value, count in counts.items():
+        subset = df[df["__target__"] == value]
+        if count < max_count:
+            sample_indices = rng.choice(subset.index, size=max_count - count, replace=True)
+            extra = subset.loc[sample_indices].copy()
+            balanced_parts.extend([subset, extra])
+        else:
+            balanced_parts.append(subset)
+    balanced_df = pd.concat(balanced_parts, ignore_index=True)
+    y_balanced = balanced_df.pop("__target__")
+    return balanced_df, y_balanced.astype(int)
 
 
 def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folder_text: str, state: Optional[Dict[str, Any]]):
@@ -264,6 +308,8 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
     target_norm = config.data.target_col
     target_series = None
     df_features = df_norm_all
+    target_mapping: Dict[str, int] | None = None
+    state.pop("target_mapping", None)
     target_msg = "Keine Zielspalte gesetzt."
     if target_norm and target_norm in df_norm_all.columns:
         target_numeric = pd.to_numeric(df_norm_all[target_norm], errors="coerce")
@@ -310,7 +356,7 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
                 target_msg = f"Zielspalte erkannt: {target_norm} (kategorisch)"
                 logger.info("ui_target_detected", target=target_norm)
                 if mapping:
-                    state["target_mapping"] = mapping
+                    target_mapping = mapping
             else:
                 target_msg = f"Zielspalte '{target_norm}' enthält keine nutzbaren Werte."
                 df_features = df_norm_all.drop(columns=[target_norm])
@@ -325,12 +371,24 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
             "excel_path": str(excel_paths[0]) if excel_paths else None,
             "sheet": sheet,
             "column_mapping": column_mappings if len(column_mappings) > 1 else next(iter(column_mappings.values())),
-            "df_features": df_features,
+            "df_features": df_features.copy(),
+            "df_features_full": df_features.copy(),
             "target": target_series,
             "target_name": target_norm,
         }
     )
     state = _reset_pipeline_state(state)
+
+    if target_mapping:
+        state["target_mapping"] = target_mapping
+
+    df_full = state.get("df_features_full", df_features.copy())
+    available_columns = list(df_full.columns)
+    default_columns = [col for col in available_columns if col not in AUTO_EXCLUDE_FEATURES]
+    if not default_columns:
+        default_columns = available_columns
+    state["selected_columns"] = default_columns
+    state["df_features"] = df_full[default_columns].copy()
 
     preview = df_norm_all.head(8)
     schema = _format_schema(df_norm_all)
@@ -358,7 +416,28 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
     if errors:
         status_parts.append("Fehler: " + "; ".join(errors))
     status = " ".join(status_parts)
-    return status, preview, schema, state
+
+    selected_columns = state.get("selected_columns", [])
+    column_selector_update = gr.update(choices=available_columns, value=selected_columns)
+    config_overview = _build_config_overview(state)
+    column_status = (
+        f"{len(selected_columns)} Spalten automatisch ausgewählt."
+        if selected_columns
+        else "Keine Spalten ausgewählt."
+    )
+
+    balance_update = gr.update(value=bool(state.get("balance_classes", False)))
+
+    return (
+        status,
+        preview,
+        schema,
+        config_overview,
+        column_selector_update,
+        column_status,
+        balance_update,
+        state,
+    )
 
 
 def build_pipeline_action(state: Optional[Dict[str, Any]]):
@@ -366,7 +445,7 @@ def build_pipeline_action(state: Optional[Dict[str, Any]]):
     df_features = state.get("df_features")
     if df_features is None or df_features.empty:
         logger.warning("ui_build_without_data")
-        return "Keine Daten geladen.", None, None, state
+        return "Bitte Daten laden und Spalten auswählen.", None, None, state
 
     config = _ensure_config(state)
     logger.info("ui_build_pipeline_start", rows=len(df_features))
@@ -423,6 +502,45 @@ def build_pipeline_action(state: Optional[Dict[str, Any]]):
     )
 
     return "Preprocessor trainiert und gespeichert.", plan_json, str(prep_path), state
+
+
+def update_selected_columns_action(selected_columns: list[str], state: Optional[Dict[str, Any]]):
+    state = state or {}
+    df_full = state.get("df_features_full")
+    if df_full is None:
+        return "Bitte zuerst Daten laden.", _build_config_overview(state), state
+
+    if not selected_columns:
+        state["df_features"] = df_full.iloc[:, 0:0].copy()
+        state["selected_columns"] = []
+        state = _reset_pipeline_state(state)
+        return "Keine Spalten ausgewählt – Pipeline zurückgesetzt.", _build_config_overview(state), state
+
+    missing = [col for col in selected_columns if col not in df_full.columns]
+    valid_columns = [col for col in selected_columns if col in df_full.columns]
+    if not valid_columns:
+        state["df_features"] = df_full.iloc[:, 0:0].copy()
+        state["selected_columns"] = []
+        state = _reset_pipeline_state(state)
+        return "Alle ausgewählten Spalten sind unbekannt – Pipeline zurückgesetzt.", _build_config_overview(state), state
+
+    df_subset = df_full[valid_columns].copy()
+    state["df_features"] = df_subset
+    state["selected_columns"] = valid_columns
+    state = _reset_pipeline_state(state)
+
+    if missing:
+        message = f"{len(valid_columns)} Spalten übernommen, unbekannte Spalten ignoriert: {', '.join(missing)}"
+    else:
+        message = f"{len(valid_columns)} Spalten für das Training ausgewählt."
+    return message, _build_config_overview(state), state
+
+
+def update_balance_action(balance_flag: bool, state: Optional[Dict[str, Any]]):
+    state = state or {}
+    state["balance_classes"] = bool(balance_flag)
+    message = "Balancierung aktiviert." if state["balance_classes"] else "Balancierung deaktiviert."
+    return message, _build_config_overview(state), state
 
 
 def preview_features_action(state: Optional[Dict[str, Any]], sample_size: int = 10):
@@ -484,6 +602,18 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         random_state=config.model.random_forest.random_state,
         stratify=stratify,
     )
+
+    if state.get("balance_classes"):
+        X_train, y_train = _balance_training_set(
+            X_train.reset_index(drop=True),
+            y_train.reset_index(drop=True),
+            config.model.random_forest.random_state,
+        )
+        logger.info(
+            "ui_training_balanced",
+            classes=int(y_train.nunique()),
+            samples=len(y_train),
+        )
 
     baseline.fit(X_train, y_train)
     y_pred = baseline.predict(X_test)
@@ -1061,6 +1191,12 @@ def build_interface() -> gr.Blocks:
                 feedback_report_preview = gr.Markdown(label="Feedback Report Vorschau")
                 feedback_report_download = gr.File(label="Feedback Report Download", interactive=False)
 
+            with gr.Tab("Konfiguration"):
+                config_info = gr.JSON(label="Aktive Konfiguration", value={})
+                column_selector = gr.CheckboxGroup(label="Spalten für das Training", choices=[])
+                balance_checkbox = gr.Checkbox(label="Ampel-Klassenbalancierung (Oversampling)", value=False)
+                column_status = gr.Textbox(label="Konfigurations-Status", interactive=False)
+
             with gr.Tab("Batch Prediction"):
                 batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
                 batch_button = gr.Button("Belege prüfen")
@@ -1070,7 +1206,19 @@ def build_interface() -> gr.Blocks:
         load_btn.click(
             load_dataset,
             inputs=[file_input, config_input, sheet_input, target_input, folder_input, state],
-            outputs=[load_status, data_preview, schema_json, state],
+            outputs=[load_status, data_preview, schema_json, config_info, column_selector, column_status, balance_checkbox, state],
+        )
+
+        column_selector.change(
+            update_selected_columns_action,
+            inputs=[column_selector, state],
+            outputs=[column_status, config_info, state],
+        )
+
+        balance_checkbox.change(
+            update_balance_action,
+            inputs=[balance_checkbox, state],
+            outputs=[column_status, config_info, state],
         )
 
         build_btn.click(
