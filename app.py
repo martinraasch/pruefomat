@@ -92,6 +92,8 @@ except Exception:  # pragma: no cover - optional dependency
     synth_run_cli = None
 
 DEFAULT_SYNTH_CONFIG = DATA_SYNTH_ROOT / "configs" / "default.yaml"
+DEFAULT_BUSINESS_RULES_PATH = DATA_SYNTH_ROOT / "configs" / "business_rules.yaml"
+DEFAULT_PROFILE_PATH = DATA_SYNTH_ROOT / "configs" / "invoice_profile.yaml"
 
 AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "negativ", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
 
@@ -192,6 +194,15 @@ def _reset_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("preprocessor", "feature_plan", "prep_path", "baseline_model", "baseline_path", "metrics_path"):
         state.pop(key, None)
     return state
+
+
+def _load_text(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def _compute_split_params(target: pd.Series, default_test_size: float = 0.2) -> tuple[int, Optional[pd.Series]]:
@@ -633,6 +644,8 @@ def generate_synthetic_data_action(
     config_file,
     business_rules_file,
     profile_file,
+    business_rules_text,
+    profile_text,
     variation,
     lines,
     ratio,
@@ -644,6 +657,7 @@ def generate_synthetic_data_action(
     state: Optional[Dict[str, Any]],
 ):
     state = state or {}
+    log_capture: list[str] = []
     if synth_run_cli is None:
         return (
             "Data Synthesizer nicht verfügbar – bitte Modul installieren.",
@@ -689,6 +703,9 @@ def generate_synthetic_data_action(
     elif DEFAULT_SYNTH_CONFIG.exists():
         config_path = DEFAULT_SYNTH_CONFIG
 
+    business_rules_content = (business_rules_text or "").strip()
+    profile_content = (profile_text or "").strip()
+
     business_rules_path = Path(business_rules_file.name) if business_rules_file is not None else None
     profile_path = Path(profile_file.name) if profile_file is not None else None
 
@@ -700,6 +717,13 @@ def generate_synthetic_data_action(
     synth_logger.addHandler(log_handler)
     if synth_logger.level > logging.INFO or synth_logger.level == 0:
         synth_logger.setLevel(logging.INFO)
+
+    if business_rules_content:
+        business_rules_path = tmp_dir / "business_rules_override.yaml"
+        business_rules_path.write_text(business_rules_content, encoding="utf-8")
+    if profile_content:
+        profile_path = tmp_dir / "profile_override.yaml"
+        profile_path.write_text(profile_content, encoding="utf-8")
 
     args = [
         "--input",
@@ -1401,6 +1425,9 @@ def feedback_fp_action(state, row_index, user, comment):
 
 
 def build_interface() -> gr.Blocks:
+    default_business_rules_text = _load_text(DEFAULT_BUSINESS_RULES_PATH)
+    default_profile_text = _load_text(DEFAULT_PROFILE_PATH)
+
     with gr.Blocks(title="pruefomat") as demo:
         gr.Markdown(
             """
@@ -1477,30 +1504,88 @@ def build_interface() -> gr.Blocks:
                 column_status = gr.Textbox(label="Konfigurations-Status", interactive=False)
 
             with gr.Tab("Synthetische Daten"):
-                synth_base = gr.File(label="Ausgangsdatei (Excel)", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
-                synth_config = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                synth_base = gr.File(
+                    label="Ausgangsdatei (Excel)",
+                    file_types=[".xlsx", ".xls"],
+                    info="Referenzdaten, z. B. `Veri-Bsp.xlsx`. Alle Struktur- und Wertstreuungen orientieren sich an diesem Sheet.",
+                )  # type: ignore[arg-type]
+                synth_config = gr.File(
+                    label="Config (optional)",
+                    file_types=[".yaml", ".yml", ".json"],
+                    info="Erweitere Pipeline-Konfiguration (Spaltenmapping, Textfeatures). Bleibt leer → Standard `configs/default.yaml`.",
+                )  # type: ignore[arg-type]
                 with gr.Row():
                     synth_business_rules = gr.File(
                         label="Business Rules (optional)",
                         file_types=[".yaml", ".yml", ".json"],
+                        info="Eigene Geschäftsregeln (z. B. MwSt-Vorgaben). Alternativ YAML unten bearbeiten.",
                     )  # type: ignore[arg-type]
                     synth_profile = gr.File(
                         label="Profil (optional)",
                         file_types=[".yaml", ".yml", ".json"],
+                        info="Profil-Presets (Variation, Textpools). Alternativ YAML unten bearbeiten.",
                     )  # type: ignore[arg-type]
-                synth_variation = gr.Slider(0.0, 1.0, value=0.35, step=0.05, label="Variation")
+                synth_business_rules_text = gr.Textbox(
+                    label="Business Rules Override (YAML)",
+                    placeholder="Optional: YAML direkt bearbeiten",
+                    lines=10,
+                    value=default_business_rules_text,
+                    info="Vorbelegung aus `configs/business_rules.yaml`. Änderungen gelten nur für diesen Lauf.",
+                )
+                synth_profile_text = gr.Textbox(
+                    label="Profil Override (YAML)",
+                    placeholder="Optional: YAML direkt bearbeiten",
+                    lines=10,
+                    value=default_profile_text,
+                    info="Vorbelegung aus `configs/invoice_profile.yaml`. Hier z. B. neue Value-Pools oder Variation-Skalen setzen.",
+                )
+                synth_variation = gr.Slider(
+                    0.0,
+                    1.0,
+                    value=0.35,
+                    step=0.05,
+                    label="Variation",
+                    info="0 = minimale Mutationen (fast Kopien), 1 = starke Abweichungen (neue Texte, Beträge). z. B. 0.3 erzeugt leichte Textvarianten.",
+                )
                 with gr.Row():
-                    synth_lines = gr.Number(value=100, precision=0, label="Ziel-Zeilen (pro Sheet)")
-                    synth_ratio = gr.Number(value=None, label="Ratio (optional)")
-                    synth_seed = gr.Number(value=1234, precision=0, label="Seed")
-                synth_gpt_enable = gr.Checkbox(label="GPT-Verfeinerung verwenden", value=True)
+                    synth_lines = gr.Number(
+                        value=100,
+                        precision=0,
+                        label="Ziel-Zeilen (pro Sheet)",
+                        info="Absolute Anzahl zusätzlicher Zeilen je Blatt. Überschreibt das Ratio. Beispiel: 250 → jeweils 250 synthetische Zeilen.",
+                    )
+                    synth_ratio = gr.Number(
+                        value=None,
+                        label="Ratio (optional)",
+                        info="Relative Menge im Vergleich zur Vorlage (1.0 = gleich viele Zeilen). Nur aktiv, wenn keine Ziel-Zeilen gesetzt sind.",
+                    )
+                    synth_seed = gr.Number(
+                        value=1234,
+                        precision=0,
+                        label="Seed",
+                        info="Deterministischer Zufalls-Seed. Gleiche Eingaben + Seed → reproduzierbare Ergebnisse.",
+                    )
+                synth_gpt_enable = gr.Checkbox(
+                    label="GPT-Verfeinerung verwenden",
+                    value=True,
+                    info="Aktiviert sprachliche Verfeinerung (z. B. plausiblere Hinweise). Erhöht Laufzeit & API-Kosten.",
+                )
                 synth_gpt_model = gr.Dropdown(
                     label="GPT-Modell",
                     choices=["gpt-5-mini", "gpt-5", "gpt-4.1-mini"],
                     value="gpt-5-mini",
+                    info="Welches OpenAI-Modell für Textplausibilisierung genutzt wird.",
                 )
-                synth_gpt_key = gr.Textbox(label="OpenAI API Key", type="password")
-                synth_debug = gr.Checkbox(label="Debug-Logging aktivieren", value=False)
+                synth_gpt_key = gr.Textbox(
+                    label="OpenAI API Key",
+                    type="password",
+                    info="API-Key nur nötig, wenn GPT aktiv ist. Wird temporär gesetzt und nach dem Lauf wieder entfernt.",
+                )
+                synth_debug = gr.Checkbox(
+                    label="Debug-Logging aktivieren",
+                    value=False,
+                    info="Schreibt detaillierte Fortschrittslogs (z. B. pro Tabelle). Gut zum Troubleshooting, verlängert ggf. den Output.",
+                )
                 synth_button = gr.Button("Synthetische Daten erzeugen")
                 synth_status = gr.Textbox(label="Generator-Status", interactive=False)
                 synth_preview = gr.Dataframe(label="Vorschau der synthetischen Daten", interactive=False)
@@ -1538,12 +1623,14 @@ def build_interface() -> gr.Blocks:
                 synth_base,
                 synth_config,
                 synth_business_rules,
-                synth_profile,
-                synth_variation,
-                synth_lines,
-                synth_ratio,
-                synth_seed,
-                synth_gpt_model,
+                    synth_profile,
+                    synth_business_rules_text,
+                    synth_profile_text,
+                    synth_variation,
+                    synth_lines,
+                    synth_ratio,
+                    synth_seed,
+                    synth_gpt_model,
                 synth_gpt_key,
                 synth_gpt_enable,
                 synth_debug,
