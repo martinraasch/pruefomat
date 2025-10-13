@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 import sys
+import logging
 
 SKIP_GRADIO_IMPORT = os.environ.get("PRUEFOMAT_DISABLE_GRADIO") == "1"
 
@@ -305,6 +306,16 @@ def _balance_training_set(
 
 def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folder_text: str, state: Optional[Dict[str, Any]]):
     state = state or {}
+    log_capture: list[str] = []
+
+    class _SynthLogHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            message = self.format(record)
+            log_capture.append(message)
+
+    log_handler = _SynthLogHandler()
+    log_handler.setLevel(logging.INFO)
+    log_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
 
     excel_paths, warnings_list = _collect_excel_files(upload, folder_text)
     if not excel_paths:
@@ -639,14 +650,15 @@ def generate_synthetic_data_action(
             None,
             None,
             None,
+            "",
             state,
         )
     if base_file is None:
-        return "Bitte eine Ausgangsdatei auswählen.", None, None, None, state
+        return "Bitte eine Ausgangsdatei auswählen.", None, None, None, "", state
 
     base_path = Path(base_file.name)
     if not base_path.exists():
-        return "Ausgangsdatei nicht gefunden.", None, None, None, state
+        return "Ausgangsdatei nicht gefunden.", None, None, None, "", state
 
     try:
         variation = float(variation)
@@ -684,6 +696,11 @@ def generate_synthetic_data_action(
     output_path = tmp_dir / f"{base_path.stem}_synthetic.xlsx"
     quality_path = tmp_dir / "quality_report.json"
 
+    synth_logger = logging.getLogger("data_synthethizer")
+    synth_logger.addHandler(log_handler)
+    if synth_logger.level > logging.INFO or synth_logger.level == 0:
+        synth_logger.setLevel(logging.INFO)
+
     args = [
         "--input",
         str(base_path),
@@ -716,30 +733,61 @@ def generate_synthetic_data_action(
     if debug_enabled:
         args.append("--debug")
 
+    log_capture.append(f"INFO Ausgangsdatei: {base_path}")
+    if config_path:
+        log_capture.append(f"INFO Konfiguration: {config_path}")
+    if business_rules_path:
+        log_capture.append(f"INFO Business Rules: {business_rules_path}")
+    if profile_path:
+        log_capture.append(f"INFO Profil: {profile_path}")
+    log_capture.append("INFO Aufruf: " + " ".join(args))
+
     prev_key = os.environ.get("OPENAI_API_KEY")
     if use_gpt:
         os.environ["OPENAI_API_KEY"] = gpt_key
 
+    progress_factory = getattr(gr, "Progress", None)
+    progress_manager = None
+    progress_callback = None
+    if callable(progress_factory):
+        try:
+            progress_manager = progress_factory(track_tqdm=False)
+        except TypeError:
+            progress_manager = progress_factory()
+        if hasattr(progress_manager, "__enter__") and hasattr(progress_manager, "__exit__"):
+            progress_callback = progress_manager.__enter__()
+        else:
+            progress_callback = progress_manager
+
     try:
-        with gr.Progress(track_tqdm=False) as progress:
-            progress(0.05, desc="Starte Generator")
-            synth_run_cli(args)
-            progress(0.9, desc="Generator abgeschlossen")
+        if progress_callback is not None:
+            progress_callback(0.05, desc="Starte Generator – Log wird aufgebaut")
+            progress_callback(0.2, desc="Parameter übergeben – Warte auf Synthesizer")
+        log_capture.append("INFO Generatorlauf gestartet")
+        synth_run_cli(args)
+        if progress_callback is not None:
+            progress_callback(0.9, desc="Generator abgeschlossen – verarbeite Ergebnisse")
+        log_capture.append("INFO Generatorlauf abgeschlossen")
     except Exception as exc:  # pragma: no cover - runtime errors
         logger.exception("synthetic_generation_failed", exc_info=exc)
         if prev_key is not None:
             os.environ["OPENAI_API_KEY"] = prev_key
         elif use_gpt:
             os.environ.pop("OPENAI_API_KEY", None)
-        return f"Fehler beim Erzeugen: {exc}", None, None, None, state
+        log_capture.append(f"ERROR {exc}")
+        return f"Fehler beim Erzeugen: {exc}", None, None, None, "\n".join(log_capture), state
     finally:
+        if progress_manager is not None and hasattr(progress_manager, "__exit__"):
+            progress_manager.__exit__(None, None, None)
         if prev_key is not None:
             os.environ["OPENAI_API_KEY"] = prev_key
         elif use_gpt:
             os.environ.pop("OPENAI_API_KEY", None)
+        synth_logger.removeHandler(log_handler)
 
     if not output_path.exists():
-        return "Generatorlauf ohne Ergebnis – bitte prüfen.", None, None, None, state
+        log_capture.append("WARN Kein Ausgabepfad erzeugt")
+        return "Generatorlauf ohne Ergebnis – bitte prüfen.", None, None, None, "\n".join(log_capture), state
 
     try:
         preview_df = pd.read_excel(output_path).head(20)
@@ -757,7 +805,8 @@ def generate_synthetic_data_action(
     synth_file = str(output_path)
     quality_file = str(quality_path) if quality_path.exists() else None
 
-    return status, preview_df, synth_file, quality_file, state
+    log_text = "\n".join(log_capture)
+    return status, preview_df, synth_file, quality_file, log_text, state
 def preview_features_action(state: Optional[Dict[str, Any]], sample_size: int = 10):
     state = state or {}
     df_features = state.get("df_features")
@@ -1457,6 +1506,7 @@ def build_interface() -> gr.Blocks:
                 synth_preview = gr.Dataframe(label="Vorschau der synthetischen Daten", interactive=False)
                 synth_download = gr.File(label="Download Synthetic Workbook", interactive=False)
                 synth_quality = gr.File(label="Download Quality Report", interactive=False)
+                synth_log = gr.Textbox(label="Generator-Log", lines=12, interactive=False)
 
             with gr.Tab("Batch Prediction"):
                 batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
@@ -1499,7 +1549,7 @@ def build_interface() -> gr.Blocks:
                 synth_debug,
                 state,
             ],
-            outputs=[synth_status, synth_preview, synth_download, synth_quality, state],
+            outputs=[synth_status, synth_preview, synth_download, synth_quality, synth_log, state],
         )
 
         build_btn.click(
