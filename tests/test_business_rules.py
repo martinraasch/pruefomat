@@ -9,6 +9,7 @@ from data_synthethizer.constraints import (
     ConditionalProbabilityConstraint,
     DependencyConstraint,
     build_default_constraints,
+    apply_dependency_rules,
 )
 
 
@@ -60,3 +61,15 @@ def test_build_default_constraints_loads_rules():
     engine = build_default_constraints(config.business_rules)
     assert any(c.name == "bounds" for c in engine.rules)
     assert any(c.name == "dependency" for c in engine.rules)
+
+
+def test_apply_dependency_rules_converts_ampel():
+    frame = pd.DataFrame({'Ampel': ['Grün', 'Gelb', 'Rot']})
+    dependencies = {
+        'Ampel': {
+            'depends_on': ['Ampel'],
+            'formula': "1 if Ampel == 'Grün' else 2 if Ampel == 'Gelb' else 3",
+        }
+    }
+    out = apply_dependency_rules(frame, dependencies)
+    assert out['Ampel'].tolist() == [1, 2, 3]

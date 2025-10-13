@@ -1,0 +1,40 @@
+# Kopiere diesen Block nach data_synthethizer/configs/business_rules.yaml
+business_rules:
+  net_column: Netto-Betrag
+  vat_column: USt-Betrag
+  gross_column: Brutto-Betrag
+  vat_rate_column: Umsatzsteuersatz
+  invoice_date_column: Rechnungsdatum
+  due_date_column: Faelligkeitsdatum
+  lock_columns:
+    - Kundennummer
+  rules:
+    - name: "Betrag muss positiv sein"
+      columns: ["Betrag"]
+      condition: "value > 0"
+
+    - name: "Betrag im realistischen Bereich"
+      columns: ["Betrag"]
+      condition: "value >= 100 and value <= 200000"
+
+    - name: "Fälligkeitsdatum nach Belegdatum"
+      columns: ["Belegdatum", "Fällig"]
+      condition: "Fällig > Belegdatum"
+      relationship: "derived"
+
+    - name: "Hohe Beträge häufiger Ampel 2/3"
+      columns: ["Betrag", "Ampel"]
+      condition: "if Betrag > 50000 then Ampel in [2, 3] with probability 0.7"
+
+  dependencies:
+    Fällig:
+      depends_on: ["Belegdatum"]
+      formula: "Belegdatum + timedelta(days=random.randint(14, 60))"
+
+    tage_bis_faellig:
+      depends_on: ["Belegdatum", "Fällig"]
+      formula: "(Fällig - Belegdatum).days"
+
+    Ampel:
+      depends_on: ["Ampel"]
+      formula: "1 if Ampel == 'Grün' else 2 if Ampel == 'Gelb' else 3"
