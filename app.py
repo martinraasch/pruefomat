@@ -1,5 +1,7 @@
 """Gradio interface for the pruefomat Veri pipeline builder."""
 
+from __future__ import annotations
+
 import json
 import os
 import sqlite3
@@ -9,7 +11,42 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 import sys
 
-import gradio as gr
+SKIP_GRADIO_IMPORT = os.environ.get("PRUEFOMAT_DISABLE_GRADIO") == "1"
+
+try:
+    if SKIP_GRADIO_IMPORT:
+        raise ModuleNotFoundError("gradio import disabled via PRUEFOMAT_DISABLE_GRADIO")
+    import gradio as gr
+except ModuleNotFoundError:  # pragma: no cover - optional dependency for tests
+    class _SilentProgress:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __call__(self, *args, **kwargs):
+            return None
+
+    class _GradioFallback:
+        """Minimal fallback to keep non-UI helpers usable when gradio is missing."""
+
+        @staticmethod
+        def update(**kwargs):
+            return kwargs
+
+        Progress = _SilentProgress
+
+        def __getattr__(self, item):  # pragma: no cover - defensive
+            raise ModuleNotFoundError(
+                "gradio is required for the interactive UI. "
+                "Install it via 'pip install gradio' to enable app.launch()."
+            )
+
+    gr = _GradioFallback()
 import joblib
 import numpy as np
 import pandas as pd
@@ -154,6 +191,30 @@ def _reset_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("preprocessor", "feature_plan", "prep_path", "baseline_model", "baseline_path", "metrics_path"):
         state.pop(key, None)
     return state
+
+
+def _compute_split_params(target: pd.Series, default_test_size: float = 0.2) -> tuple[int, Optional[pd.Series]]:
+    """Return a safe test size and optional stratify series for tiny datasets."""
+
+    clean_target = target.dropna()
+    n_samples = len(clean_target)
+    if n_samples < 2:
+        return 1, None
+
+    test_size_count = max(1, int(round(n_samples * default_test_size)))
+    if test_size_count >= n_samples:
+        test_size_count = max(1, n_samples - 1)
+
+    class_counts = clean_target.value_counts()
+    if class_counts.empty:
+        return test_size_count, None
+
+    n_classes = len(class_counts)
+    min_class = class_counts.min()
+    if min_class < 2 or test_size_count < n_classes:
+        return test_size_count, None
+
+    return test_size_count, target
 
 
 def _build_config_overview(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -748,11 +809,11 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         ]
     )
 
-    stratify = target if target.dropna().nunique() > 1 else None
+    test_size_count, stratify = _compute_split_params(target)
     X_train, X_test, y_train, y_test = train_test_split(
         df_features,
         target,
-        test_size=0.2,
+        test_size=test_size_count,
         random_state=config.model.random_forest.random_state,
         stratify=stratify,
     )
@@ -814,12 +875,31 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             pos_scores = proba.max(axis=1)
 
     fraud_scores = pd.Series(pos_scores * 100.0, name="fraud_score")
-    predictions_raw = pd.Series(baseline.predict(X_test))
-    predictions_numeric = pd.to_numeric(predictions_raw, errors="coerce")
-    if predictions_numeric.notna().all():
-        predictions_col = predictions_numeric.round().astype(int)
+    predictions_raw = pd.Series(baseline.predict(X_test), name="prediction_raw")
+
+    positive_label = None
+    classifier = baseline.named_steps.get("classifier")
+    classes = list(getattr(classifier, "classes_", []))
+    n_classes = len(classes)
+
+    if n_classes == 2:
+        positive_index = 1
+        for candidate in ("1", 1, "fraud", "Fraud", True):
+            if candidate in classes:
+                positive_index = classes.index(candidate)
+                break
+        positive_label = classes[positive_index]
+
+    if positive_label is not None:
+        predictions_binary = (predictions_raw == positive_label).astype(int)
     else:
-        predictions_col = predictions_raw
+        predictions_binary = pd.Series(
+            np.where(fraud_scores >= 50.0, 1, 0),
+            index=predictions_raw.index,
+            name="prediction",
+        )
+
+    predictions_col = predictions_binary.rename("prediction")
 
     actual_series = pd.Series(y_test).reset_index(drop=True)
     predictions_col = predictions_col.reset_index(drop=True)
@@ -830,17 +910,12 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "row_index": np.arange(len(fraud_scores)),
             "fraud_score": fraud_scores,
             "prediction": predictions_col,
+            "prediction_raw": predictions_raw.reset_index(drop=True),
             "actual": actual_series,
         }
     )
     predictions_df.sort_values("fraud_score", ascending=False, inplace=True)
     predictions_display = predictions_df.head(50).reset_index(drop=True)
-    predictions_display.columns = ["Index", "Score", "Prediction", "Actual"]
-    predictions_display_ui = {
-        "headers": ["Index", "Score", "Prediction", "Actual"],
-        "data": predictions_display.values.astype(object).tolist(),
-        "row_headers": [str(i) for i in range(len(predictions_display))],
-    }
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_model_"))
     model_path = tmp_dir / "baseline_model.joblib"
@@ -875,8 +950,8 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "predictions_path": str(predictions_path),
             "shap_feature_names": list(feature_names),
             "feature_importances": importance_df.to_dict(orient="records"),
-        "predictions_full": predictions_df,
-    }
+            "predictions_full": predictions_df,
+        }
     )
 
     try:
@@ -919,7 +994,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         top20,
         plot_image,
         str(importance_path),
-        predictions_display_ui,
+        predictions_display,
         str(predictions_path),
         state,
     )

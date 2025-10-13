@@ -10,6 +10,7 @@ from app import (
     DEFAULT_CONFIG,
     DEFAULT_CONFIG_PATH,
     FEEDBACK_DB_PATH,
+    build_pipeline_action,
     batch_predict_action,
     explain_prediction_action,
     feedback_fp_action,
@@ -49,26 +50,97 @@ def patch_shap(monkeypatch):
 @pytest.fixture
 def baseline_state():
     data = {
-        "Betrag": ["1000,00", "2500,00", "500,00", "1500,00", "750,00", "1800,00"],
-        "Belegdatum": ["01.01.2025", "05.01.2025", "06.01.2025", "07.01.2025", "08.01.2025", "09.01.2025"],
-        "Fällig": ["03.01.2025", "10.01.2025", "06.02.2025", "07.02.2025", "08.02.2025", "10.02.2025"],
-        "Land": ["DE", "DE", "AT", "DE", "AT", "DE"],
-        "BUK": ["A", "B", "A", "C", "B", "A"],
-        "Debitor": ["100", "101", "102", "103", "104", "105"],
-        "DEB Name": ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"],
-        "Maßnahme 2025": ["Pruefen", "Rueckruf", "", "Nachfassen", "Klärung", "Pruefen"],
-        "Hinweise": ["Verdacht", "ok", "Warnung", "Bitte prüfen", "offen", "Verdächtig"],
-        "Ampel": [1, 2, 1, 3, 1, 2],
+        "Betrag": [
+            "1000,00",
+            "2500,00",
+            "500,00",
+            "1500,00",
+            "750,00",
+            "1800,00",
+            "2200,00",
+            "1950,00",
+            "640,00",
+            "3100,00",
+        ],
+        "Belegdatum": [
+            "01.01.2025",
+            "05.01.2025",
+            "06.01.2025",
+            "07.01.2025",
+            "08.01.2025",
+            "09.01.2025",
+            "10.01.2025",
+            "11.01.2025",
+            "12.01.2025",
+            "13.01.2025",
+        ],
+        "Fällig": [
+            "03.01.2025",
+            "10.01.2025",
+            "06.02.2025",
+            "07.02.2025",
+            "08.02.2025",
+            "10.02.2025",
+            "11.02.2025",
+            "12.02.2025",
+            "13.02.2025",
+            "14.02.2025",
+        ],
+        "Land": ["DE", "DE", "AT", "DE", "AT", "DE", "DE", "AT", "DE", "DE"],
+        "BUK": ["A", "B", "A", "C", "B", "A", "C", "B", "A", "C"],
+        "Debitor": ["100", "101", "102", "103", "104", "105", "106", "107", "108", "109"],
+        "DEB Name": [
+            "Alpha",
+            "Beta",
+            "Gamma",
+            "Delta",
+            "Epsilon",
+            "Zeta",
+            "Eta",
+            "Theta",
+            "Iota",
+            "Kappa",
+        ],
+        "Maßnahme 2025": [
+            "Pruefen",
+            "Rueckruf",
+            "",
+            "Nachfassen",
+            "Klärung",
+            "Pruefen",
+            "Überprüfung",
+            "Monitoring",
+            "Reminder",
+            "Erinnerung",
+        ],
+        "Hinweise": [
+            "Verdacht",
+            "ok",
+            "Warnung",
+            "Bitte prüfen",
+            "offen",
+            "Verdächtig",
+            "Rückfrage",
+            "Nachhaken",
+            "Zahlung angekündigt",
+            "Telefonat ausstehend",
+        ],
+        "Ampel": [1, 2, 1, 3, 1, 2, 3, 1, 2, 3],
     }
     df = pd.DataFrame(data)
     features = df.drop(columns=["Ampel"])
     target = df["Ampel"]
+    config = DEFAULT_CONFIG.model_copy(deep=True)
+    config.preprocessing.tfidf_min_df = 1
+
     state = {
-        "config": DEFAULT_CONFIG.model_copy(deep=True),
+        "config": config,
         "config_path": str(DEFAULT_CONFIG_PATH),
         "df_features": features,
         "target": target,
     }
+    pipeline_result = build_pipeline_action(state)
+    state = pipeline_result[-1]
     result = train_baseline_action(state)
     metrics = result[1]
     predictions = result[8]

@@ -90,6 +90,16 @@ def parse_date_series(series: pd.Series, dayfirst: bool = True) -> pd.Series:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             best = pd.to_datetime(text, errors="coerce")
+    else:
+        # Fill any remaining NaT entries with a dayfirst-agnostic parse so
+        # ISO-style dates (yyyy-mm-dd) stay intact regardless of the initial flag.
+        na_mask = best.isna()
+        if na_mask.any():
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                fallback = pd.to_datetime(text[na_mask], errors="coerce")
+            best = best.copy()
+            best.loc[na_mask] = fallback
     return best
 
 

@@ -24,14 +24,39 @@ def precision_recall_at_k(y_true: np.ndarray, scores: np.ndarray, k: float) -> T
 
     if k <= 0 or k > 1:
         raise ValueError("k must be in (0, 1]")
+    if len(y_true) != len(scores):
+        raise ValueError("y_true and scores must have the same length")
+
     order = np.argsort(scores)[::-1]
+    positives = int(np.sum(y_true == 1))
+    if positives == 0:
+        return 0.0, 0.0
+
     limit = max(1, int(np.ceil(len(scores) * k)))
-    top_idx = order[:limit]
-    y_top = y_true[top_idx]
-    positives = np.sum(y_true == 1)
-    positives = max(positives, 1)
-    precision = float(np.mean(y_top))
-    recall = float(np.sum(y_top) / positives)
+    selected_labels: list[int] = []
+    selected_scores: list[float] = []
+
+    for idx in order:
+        label = int(y_true[idx])
+        score = float(scores[idx])
+        selected_labels.append(label)
+        selected_scores.append(score)
+        if len(selected_labels) > limit:
+            if 0 in selected_labels:
+                zero_indices = [i for i, val in enumerate(selected_labels) if val == 0]
+                remove_idx = zero_indices[-1]
+            else:
+                remove_idx = len(selected_labels) - 1
+            selected_labels.pop(remove_idx)
+            selected_scores.pop(remove_idx)
+
+        if len(selected_labels) == limit and all(val == 1 for val in selected_labels):
+            # early exit once we already have the best-possible set of positives
+            break
+
+    tp = float(sum(selected_labels))
+    precision = tp / float(len(selected_labels)) if selected_labels else 0.0
+    recall = tp / float(positives)
     return precision, recall
 
 
