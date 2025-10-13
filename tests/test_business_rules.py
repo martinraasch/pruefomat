@@ -4,7 +4,11 @@ from pathlib import Path
 import pandas as pd
 
 from data_synthethizer.config import load_config
-from app import _apply_bias_patch, _parse_business_rules_block
+from app import (
+    _apply_bias_patch,
+    _parse_business_rules_block,
+    generate_bias_rules_action,
+)
 from data_synthethizer.constraints import (
     BoundsConstraint,
     ConditionalProbabilityConstraint,
@@ -127,3 +131,46 @@ business_rules:
     all_names = [rule["name"] for rule in block["rules"]]
     assert len(all_names) == 3
     assert len(set(all_names)) == 3
+
+
+def test_generate_bias_rules_action(monkeypatch, tmp_path):
+    state = {}
+    base_path = tmp_path / "base.xlsx"
+    pd.DataFrame({"Belegdatum": [pd.Timestamp("2024-01-01")], "Betrag": [100.0], "Ampel": [1]}).to_excel(
+        base_path,
+        index=False,
+    )
+
+    class DummyFile:
+        def __init__(self, name):
+            self.name = name
+
+    monkeypatch.setattr(
+        "app._call_bias_llm",
+        lambda **kwargs: {
+            "rules": [
+                {
+                    "name": "Bias Montag Gelb",
+                    "columns": ["Belegdatum", "Ampel"],
+                    "condition": "weekday(Belegdatum) == 0",
+                }
+            ],
+            "dependencies": {},
+        },
+    )
+    monkeypatch.setattr("app._collect_excel_columns", lambda path: ["Belegdatum", "Betrag", "Ampel"])
+
+    status, yaml_text, new_state = generate_bias_rules_action(
+        state,
+        "Mache es wahrscheinlicher",
+        "",
+        DummyFile(str(base_path)),
+        True,
+        "gpt-5-mini",
+        "sk-test",
+    )
+
+    assert "Bias-Regeln generiert" in status or "Bias-Prompt" in status
+    assert "Bias Montag Gelb" in yaml_text
+    assert "business_rules" in yaml_text
+    assert "bias_rules_yaml" in new_state

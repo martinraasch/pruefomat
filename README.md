@@ -107,7 +107,7 @@ All downloads appear as clickable files below each action.
 ### Tab 2 – Synthetische Daten
 - Wähle eine Excel-Referenzdatei. Die Struktur und Wertebereiche dienen als Grundlage für synthetische Zeilen.
 - Passe optional Business-Rules- oder Profil-YAML direkt im Editor an, statt separate Dateien hochzuladen.
-- Nutze das neue **Bias-Prompt**-Feld, um natürliche Sprache in Wahrscheinlichkeitsregeln zu verwandeln (z. B. "Erhöhe Ampel Gelb um 5 %, wenn Belegdatum ein Montag ist"). Dafür muss GPT aktiviert sein und ein OpenAI-Key hinterlegt werden.
+- Nutze das **Bias-Prompt**-Feld und klicke anschließend auf **Bias-Regeln generieren**, um natürliche Sprache zuerst in ein YAML-Snippet zu verwandeln. Das Ergebnis erscheint im Bias-Regeln-Editor und kann vor der Generierung angepasst werden.
 - Steuere Variation, Zielzeilen/Ratio sowie Seed und starte die Generierung. Log, Vorschau, Download und Quality Report stehen anschließend als Outputs bereit.
 
 ### Tab 3 – Batch Prediction
