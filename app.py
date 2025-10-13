@@ -395,7 +395,6 @@ def _call_bias_llm(
                     ],
                     response_format={"type": "json_object"},
                     max_output_tokens=800,
-                    temperature=0.1,
                 )
             except TypeError as exc:
                 if "response_format" not in str(exc):
@@ -407,7 +406,6 @@ def _call_bias_llm(
                         {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
                     ],
                     max_output_tokens=800,
-                    temperature=0.1,
                 )
         else:  # pragma: no cover - legacy client branch
             response = client.chat.completions.create(
@@ -417,7 +415,6 @@ def _call_bias_llm(
                     {"role": "user", "content": user_prompt},
                 ],
                 max_tokens=800,
-                temperature=0.1,
             )
     except Exception as exc:  # pragma: no cover - network errors
         raise BiasPromptError(f"OpenAI-Anfrage fehlgeschlagen: {exc}") from exc
