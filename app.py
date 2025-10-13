@@ -386,16 +386,29 @@ def _call_bias_llm(
 
     try:
         if hasattr(client, "responses"):
-            response = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-                    {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-                ],
-                response_format={"type": "json_object"},
-                max_output_tokens=800,
-                temperature=0.1,
-            )
+            try:
+                response = client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                        {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_output_tokens=800,
+                    temperature=0.1,
+                )
+            except TypeError as exc:
+                if "response_format" not in str(exc):
+                    raise
+                response = client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                        {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+                    ],
+                    max_output_tokens=800,
+                    temperature=0.1,
+                )
         else:  # pragma: no cover - legacy client branch
             response = client.chat.completions.create(
                 model=model,
