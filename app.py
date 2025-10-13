@@ -1448,9 +1448,14 @@ def build_interface() -> gr.Blocks:
             """
             <style>
             .pf-field-label {font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:6px;}
-            .pf-tooltip {position:relative;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:#e0e0e0;color:#333;font-size:12px;cursor:help;}
-            .pf-tooltiptext {visibility:hidden;opacity:0;transition:opacity 0.2s ease;position:absolute;z-index:20;background:#1e1e1e;color:#fff;padding:10px;border-radius:6px;width:280px;bottom:130%;left:50%;transform:translateX(-50%);box-shadow:0 4px 12px rgba(0,0,0,0.25);font-weight:400;line-height:1.4;}
-            .pf-tooltiptext::after {content:"";position:absolute;top:100%;left:50%;margin-left:-6px;border-width:6px;border-style:solid;border-color:#1e1e1e transparent transparent transparent;}
+            .pf-tooltip {position:relative;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:#f8f9fa;color:#141414;font-size:12px;border:1px solid #d0d7de;cursor:help;}
+            .pf-tooltiptext {visibility:hidden;opacity:0;transition:opacity 0.2s ease;position:absolute;z-index:20;background:#ffffff;color:#141414;padding:10px;border-radius:6px;width:280px;bottom:130%;left:50%;transform:translateX(-50%);box-shadow:0 4px 12px rgba(15,23,42,0.18);border:1px solid #d0d7de;font-weight:400;line-height:1.4;}
+            .pf-tooltiptext::after {content:"";position:absolute;top:100%;left:50%;margin-left:-6px;border-width:6px;border-style:solid;border-color:#ffffff transparent transparent transparent;}
+            .gradio-container .pf-tooltiptext,
+            .gradio-container .pf-tooltiptext::after,
+            .gradio-container.dark .pf-tooltiptext,
+            .gradio-container.dark .pf-tooltiptext::after {background:#ffffff !important;color:#141414 !important;border-color:#d0d7de !important;}
+            .gradio-container.dark .pf-tooltiptext::after {border-color:#ffffff transparent transparent transparent !important;}
             .pf-tooltip:hover .pf-tooltiptext {visibility:visible;opacity:1;}
             </style>
             """
