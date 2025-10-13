@@ -7,6 +7,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
+import sys
 
 import gradio as gr
 import joblib
@@ -41,6 +42,18 @@ os.environ.setdefault("GRADIO_DISABLE_USAGE_STATS", "True")
 
 configure_logging()
 logger = get_logger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_SYNTH_ROOT = PROJECT_ROOT.parent / "data_synthethizer"
+DATA_SYNTH_SRC = DATA_SYNTH_ROOT / "src"
+if DATA_SYNTH_SRC.exists() and str(DATA_SYNTH_SRC) not in sys.path:
+    sys.path.insert(0, str(DATA_SYNTH_SRC))
+try:
+    from data_synthethizer.synthetic_data_generator import run_cli as synth_run_cli
+except Exception:  # pragma: no cover - optional dependency
+    synth_run_cli = None
+
+DEFAULT_SYNTH_CONFIG = DATA_SYNTH_ROOT / "configs" / "default.yaml"
 
 AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "negativ", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
 
@@ -543,6 +556,147 @@ def update_balance_action(balance_flag: bool, state: Optional[Dict[str, Any]]):
     return message, _build_config_overview(state), state
 
 
+def generate_synthetic_data_action(
+    base_file,
+    config_file,
+    business_rules_file,
+    profile_file,
+    variation,
+    lines,
+    ratio,
+    seed,
+    gpt_model,
+    gpt_key,
+    gpt_enabled,
+    debug_enabled,
+    state: Optional[Dict[str, Any]],
+):
+    state = state or {}
+    if synth_run_cli is None:
+        return (
+            "Data Synthesizer nicht verfügbar – bitte Modul installieren.",
+            None,
+            None,
+            None,
+            state,
+        )
+    if base_file is None:
+        return "Bitte eine Ausgangsdatei auswählen.", None, None, None, state
+
+    base_path = Path(base_file.name)
+    if not base_path.exists():
+        return "Ausgangsdatei nicht gefunden.", None, None, None, state
+
+    try:
+        variation = float(variation)
+    except (TypeError, ValueError):
+        variation = 0.35
+    if variation < 0:
+        variation = 0.0
+    if variation > 1:
+        variation = 1.0
+
+    try:
+        lines_int = int(lines) if lines not in (None, "") else None
+    except (TypeError, ValueError):
+        lines_int = None
+    try:
+        ratio_val = float(ratio) if ratio not in (None, "") else None
+    except (TypeError, ValueError):
+        ratio_val = None
+
+    try:
+        seed_val = int(seed) if seed not in (None, "") else None
+    except (TypeError, ValueError):
+        seed_val = None
+
+    config_path = None
+    if config_file is not None:
+        config_path = Path(config_file.name)
+    elif DEFAULT_SYNTH_CONFIG.exists():
+        config_path = DEFAULT_SYNTH_CONFIG
+
+    business_rules_path = Path(business_rules_file.name) if business_rules_file is not None else None
+    profile_path = Path(profile_file.name) if profile_file is not None else None
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_synth_"))
+    output_path = tmp_dir / f"{base_path.stem}_synthetic.xlsx"
+    quality_path = tmp_dir / "quality_report.json"
+
+    args = [
+        "--input",
+        str(base_path),
+        "--output",
+        str(output_path),
+        "--variation",
+        f"{variation}",
+    ]
+    if lines_int and lines_int > 0:
+        args.extend(["--lines", str(lines_int)])
+    elif ratio_val and ratio_val > 0:
+        args.extend(["--ratio", f"{ratio_val}"])
+    if seed_val is not None:
+        args.extend(["--seed", str(seed_val)])
+    if config_path:
+        args.extend(["--column-config", str(config_path)])
+    if business_rules_path:
+        args.extend(["--business-rules", str(business_rules_path)])
+    if profile_path:
+        args.extend(["--profile", str(profile_path)])
+    args.extend(["--quality-report", str(quality_path)])
+
+    use_gpt = bool(gpt_enabled) and bool(gpt_key)
+    if use_gpt:
+        args.extend(["--gpt-model", gpt_model or "gpt-5-mini"])
+        args.extend(["--openai-api-key", gpt_key])
+    else:
+        args.append("--disable-gpt")
+
+    if debug_enabled:
+        args.append("--debug")
+
+    prev_key = os.environ.get("OPENAI_API_KEY")
+    if use_gpt:
+        os.environ["OPENAI_API_KEY"] = gpt_key
+
+    try:
+        with gr.Progress(track_tqdm=False) as progress:
+            progress(0.05, desc="Starte Generator")
+            synth_run_cli(args)
+            progress(0.9, desc="Generator abgeschlossen")
+    except Exception as exc:  # pragma: no cover - runtime errors
+        logger.exception("synthetic_generation_failed", exc_info=exc)
+        if prev_key is not None:
+            os.environ["OPENAI_API_KEY"] = prev_key
+        elif use_gpt:
+            os.environ.pop("OPENAI_API_KEY", None)
+        return f"Fehler beim Erzeugen: {exc}", None, None, None, state
+    finally:
+        if prev_key is not None:
+            os.environ["OPENAI_API_KEY"] = prev_key
+        elif use_gpt:
+            os.environ.pop("OPENAI_API_KEY", None)
+
+    if not output_path.exists():
+        return "Generatorlauf ohne Ergebnis – bitte prüfen.", None, None, None, state
+
+    try:
+        preview_df = pd.read_excel(output_path).head(20)
+    except Exception:
+        preview_df = None
+
+    status = f"Synthetische Daten erzeugt: {output_path.name}"
+    if quality_path.exists():
+        status += f" | Quality Report: {quality_path.name}"
+
+    state["last_generated_path"] = str(output_path)
+    if quality_path.exists():
+        state["last_quality_path"] = str(quality_path)
+
+    synth_file = str(output_path)
+    quality_file = str(quality_path) if quality_path.exists() else None
+
+    return status, preview_df, synth_file, quality_file, state
 def preview_features_action(state: Optional[Dict[str, Any]], sample_size: int = 10):
     state = state or {}
     df_features = state.get("df_features")
@@ -1133,6 +1287,7 @@ def build_interface() -> gr.Blocks:
         state = gr.State({
             "config": DEFAULT_CONFIG.model_copy(deep=True),
             "config_path": str(DEFAULT_CONFIG_PATH),
+            "balance_classes": False,
         })
 
         with gr.Tabs():
@@ -1197,6 +1352,37 @@ def build_interface() -> gr.Blocks:
                 balance_checkbox = gr.Checkbox(label="Ampel-Klassenbalancierung (Oversampling)", value=False)
                 column_status = gr.Textbox(label="Konfigurations-Status", interactive=False)
 
+            with gr.Tab("Synthetische Daten"):
+                synth_base = gr.File(label="Ausgangsdatei (Excel)", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+                synth_config = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                with gr.Row():
+                    synth_business_rules = gr.File(
+                        label="Business Rules (optional)",
+                        file_types=[".yaml", ".yml", ".json"],
+                    )  # type: ignore[arg-type]
+                    synth_profile = gr.File(
+                        label="Profil (optional)",
+                        file_types=[".yaml", ".yml", ".json"],
+                    )  # type: ignore[arg-type]
+                synth_variation = gr.Slider(0.0, 1.0, value=0.35, step=0.05, label="Variation")
+                with gr.Row():
+                    synth_lines = gr.Number(value=100, precision=0, label="Ziel-Zeilen (pro Sheet)")
+                    synth_ratio = gr.Number(value=None, label="Ratio (optional)")
+                    synth_seed = gr.Number(value=1234, precision=0, label="Seed")
+                synth_gpt_enable = gr.Checkbox(label="GPT-Verfeinerung verwenden", value=True)
+                synth_gpt_model = gr.Dropdown(
+                    label="GPT-Modell",
+                    choices=["gpt-5-mini", "gpt-5", "gpt-4.1-mini"],
+                    value="gpt-5-mini",
+                )
+                synth_gpt_key = gr.Textbox(label="OpenAI API Key", type="password")
+                synth_debug = gr.Checkbox(label="Debug-Logging aktivieren", value=False)
+                synth_button = gr.Button("Synthetische Daten erzeugen")
+                synth_status = gr.Textbox(label="Generator-Status", interactive=False)
+                synth_preview = gr.Dataframe(label="Vorschau der synthetischen Daten", interactive=False)
+                synth_download = gr.File(label="Download Synthetic Workbook", interactive=False)
+                synth_quality = gr.File(label="Download Quality Report", interactive=False)
+
             with gr.Tab("Batch Prediction"):
                 batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
                 batch_button = gr.Button("Belege prüfen")
@@ -1219,6 +1405,26 @@ def build_interface() -> gr.Blocks:
             update_balance_action,
             inputs=[balance_checkbox, state],
             outputs=[column_status, config_info, state],
+        )
+
+        synth_button.click(
+            generate_synthetic_data_action,
+            inputs=[
+                synth_base,
+                synth_config,
+                synth_business_rules,
+                synth_profile,
+                synth_variation,
+                synth_lines,
+                synth_ratio,
+                synth_seed,
+                synth_gpt_model,
+                synth_gpt_key,
+                synth_gpt_enable,
+                synth_debug,
+                state,
+            ],
+            outputs=[synth_status, synth_preview, synth_download, synth_quality, state],
         )
 
         build_btn.click(
