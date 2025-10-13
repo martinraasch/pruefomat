@@ -6,9 +6,10 @@ import json
 import os
 import sqlite3
 import tempfile
+import textwrap
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import sys
 import logging
 
@@ -53,6 +54,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import shap
+import yaml
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (balanced_accuracy_score, classification_report,
                              confusion_matrix, f1_score, precision_score,
@@ -238,6 +240,314 @@ def _compute_split_params(target: pd.Series, default_test_size: float = 0.2) -> 
         return test_size_count, None
 
     return test_size_count, target
+
+
+class BiasPromptError(RuntimeError):
+    """Raised when a natural-language bias prompt cannot be transformed."""
+
+
+def _extract_response_text(response: Any) -> Optional[str]:
+    """Best-effort extraction for both Responses and ChatCompletion payloads."""
+
+    if response is None:
+        return None
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return str(output_text).strip()
+
+    if hasattr(response, "output"):
+        chunks: List[str] = []
+        for item in getattr(response, "output", []):
+            item_type = getattr(item, "type", None)
+            if item_type == "message":
+                for content in getattr(item, "content", []):
+                    if getattr(content, "type", None) in {"text", "output_text"}:
+                        chunks.append(getattr(content, "text", ""))
+            elif item_type in {"output_text", "text"}:
+                chunks.append(getattr(item, "text", ""))
+        combined = " ".join(chunk.strip() for chunk in chunks if chunk)
+        if combined.strip():
+            return combined.strip()
+
+    choices = getattr(response, "choices", None)
+    if choices:
+        choice0 = choices[0]
+        message = getattr(choice0, "message", None)
+        if message and getattr(message, "content", None):
+            return str(message.content).strip()
+        text = getattr(choice0, "text", None)
+        if text:
+            return str(text).strip()
+    return None
+
+
+def _extract_json_block(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return None
+    sanitized = text.strip()
+    if sanitized.startswith("```"):
+        parts = sanitized.split("```")
+        if len(parts) >= 2:
+            sanitized = parts[1].strip()
+    if sanitized.lower().startswith("json"):
+        sanitized = sanitized[4:].lstrip()
+    if sanitized.startswith("{") and sanitized.endswith("}"):
+        return sanitized
+    start_idx = sanitized.find("{")
+    end_idx = sanitized.rfind("}")
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        return sanitized[start_idx : end_idx + 1]
+    return None
+
+
+def _collect_excel_columns(path: Path, max_sheets: int = 3, sample_rows: int = 5) -> List[str]:
+    columns: List[str] = []
+    ext = path.suffix.lower()
+    try:
+        if ext in {".csv"}:
+            frame = pd.read_csv(path, nrows=sample_rows)
+            columns.extend(str(col) for col in frame.columns)
+        elif ext in {".xls", ".xlsx", ".xlsm", ".xlsb"}:
+            workbook = pd.ExcelFile(path)
+            for sheet_name in workbook.sheet_names[:max_sheets]:
+                try:
+                    frame = workbook.parse(sheet_name, nrows=sample_rows)
+                except Exception:
+                    continue
+                columns.extend(str(col) for col in frame.columns)
+        else:
+            frame = pd.read_excel(path, nrows=sample_rows)
+            columns.extend(str(col) for col in frame.columns)
+    except Exception:
+        columns = []
+
+    if not columns:
+        return []
+    deduped: List[str] = []
+    seen = set()
+    for col in columns:
+        if col not in seen:
+            deduped.append(col)
+            seen.add(col)
+    return deduped
+
+
+def _call_bias_llm(
+    *,
+    prompt: str,
+    columns: List[str],
+    existing_rule_names: List[str],
+    model: str,
+    api_key: str,
+) -> Dict[str, Any]:
+    try:
+        from openai import OpenAI  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise BiasPromptError(
+            "Für Bias-Prompts wird das 'openai'-Paket benötigt. Bitte installiere es oder deaktiviere den Bias-Prompt."
+        ) from exc
+
+    client = OpenAI(api_key=api_key)
+    column_text = "\n".join(f"- {name}" for name in columns) if columns else "- (keine Spalten erkannt)"
+    existing_text = ", ".join(existing_rule_names) if existing_rule_names else "(keine vorhanden)"
+
+    helper_doc = (
+        "Hilfsfunktionen: weekday(Belegdatum) -> 0..6 (Montag=0), "
+        "isoweekday(Belegdatum) -> 1..7 (Montag=1), "
+        "is_round_amount(Betrag, decimals=2) -> bool."
+    )
+
+    system_prompt = textwrap.dedent(
+        """
+        Du wandelst natürliche Sprache in strukturierte Regeln für einen Syntheseprozessor um.
+        Erzeuge JSON mit den Feldern "rules" und optional "dependencies".
+        Jede Regel: {"name": str, "columns": [Spaltennamen], "condition": str}.
+        Form von Wahrscheinlichkeiten: "if <Bedingung> then <Spalte> in [Werte] with probability <0.x>".
+        Verwende ausschließlich die aufgeführten Spaltennamen und Hilfsfunktionen.
+        Prozentangaben wie 5% → 0.05, 30 Prozent → 0.3.
+        Keine freien Texte, nur valides JSON.
+        """
+    ).strip()
+
+    user_prompt = textwrap.dedent(
+        f"""
+        Verfügbare Spalten:
+        {column_text}
+
+        Vorhandene Regel-Namen: {existing_text}
+        {helper_doc}
+
+        Anweisung:
+        {prompt.strip()}
+
+        Gib ausschließlich JSON zurück.
+        """
+    ).strip()
+
+    try:
+        if hasattr(client, "responses"):
+            response = client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+                ],
+                response_format={"type": "json_object"},
+                max_output_tokens=800,
+                temperature=0.1,
+            )
+        else:  # pragma: no cover - legacy client branch
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=800,
+                temperature=0.1,
+            )
+    except Exception as exc:  # pragma: no cover - network errors
+        raise BiasPromptError(f"OpenAI-Anfrage fehlgeschlagen: {exc}") from exc
+
+    text = _extract_response_text(response)
+    json_text = _extract_json_block(text) if text else None
+    candidate = json_text or text
+    if not candidate:
+        raise BiasPromptError("LLM lieferte kein gültiges JSON zurück.")
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise BiasPromptError(f"JSON konnte nicht geparst werden: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise BiasPromptError("Ergebnis muss ein JSON-Objekt sein.")
+    return payload
+
+
+def _normalise_bias_patch(data: Dict[str, Any]) -> Dict[str, Any]:
+    rules_raw = data.get("rules", []) if isinstance(data, dict) else []
+    dependencies_raw = data.get("dependencies", {}) if isinstance(data, dict) else {}
+
+    rules: List[Dict[str, Any]] = []
+    for entry in rules_raw or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "Bias-Regel")
+        columns = entry.get("columns", [])
+        if isinstance(columns, (list, tuple)):
+            column_list = [str(col) for col in columns if str(col).strip()]
+        else:
+            column_list = [str(columns)] if columns else []
+        condition = str(entry.get("condition", "")).strip()
+        if not condition:
+            continue
+        rule = {
+            "name": name,
+            "columns": column_list,
+            "condition": condition,
+        }
+        rules.append(rule)
+
+    dependencies: Dict[str, Dict[str, Any]] = {}
+    if isinstance(dependencies_raw, dict):
+        for key, value in dependencies_raw.items():
+            if not isinstance(value, dict):
+                continue
+            formula = value.get("formula")
+            if not formula:
+                continue
+            depends_on = value.get("depends_on", [])
+            if isinstance(depends_on, (list, tuple)):
+                depends_list = [str(dep) for dep in depends_on if str(dep).strip()]
+            else:
+                depends_list = [str(depends_on)] if depends_on else []
+            dependencies[str(key)] = {
+                "depends_on": depends_list,
+                "formula": str(formula),
+            }
+
+    return {"rules": rules, "dependencies": dependencies}
+
+
+def _parse_business_rules_block(content: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if not content.strip():
+        base: Dict[str, Any] = {"business_rules": {}}
+        return base, base["business_rules"]
+    try:
+        data = yaml.safe_load(content) or {}
+    except yaml.YAMLError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if "business_rules" in data and isinstance(data["business_rules"], dict):
+        return data, data["business_rules"]
+    business_block = data
+    wrapper = {"business_rules": business_block}
+    return wrapper, business_block
+
+
+def _apply_bias_patch(
+    data: Dict[str, Any],
+    business_block: Dict[str, Any],
+    patch: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    rules_list = business_block.setdefault("rules", [])
+    if not isinstance(rules_list, list):
+        rules_list = business_block["rules"] = []
+    dependencies_map = business_block.setdefault("dependencies", {})
+    if not isinstance(dependencies_map, dict):
+        dependencies_map = business_block["dependencies"] = {}
+
+    existing_names = {
+        str(rule.get("name"))
+        for rule in rules_list
+        if isinstance(rule, dict) and rule.get("name")
+    }
+
+    added_rules: List[Dict[str, Any]] = []
+    for entry in patch.get("rules", []):
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "Bias-Regel")
+        original_name = name
+        suffix = 2
+        while name in existing_names:
+            name = f"{original_name} ({suffix})"
+            suffix += 1
+        columns = entry.get("columns", [])
+        if isinstance(columns, (list, tuple)):
+            column_list = [str(col) for col in columns if str(col).strip()]
+        else:
+            column_list = [str(columns)] if columns else []
+        condition = str(entry.get("condition", "")).strip()
+        if not condition:
+            continue
+        rule_copy = {
+            "name": name,
+            "columns": column_list,
+            "condition": condition,
+        }
+        rules_list.append(rule_copy)
+        added_rules.append(rule_copy)
+        existing_names.add(name)
+
+    added_dependencies: Dict[str, Dict[str, Any]] = {}
+    for key, value in patch.get("dependencies", {}).items():
+        if not isinstance(value, dict):
+            continue
+        formula = value.get("formula")
+        if not formula:
+            continue
+        depends_on = value.get("depends_on", [])
+        if isinstance(depends_on, (list, tuple)):
+            depends_list = [str(dep) for dep in depends_on if str(dep).strip()]
+        else:
+            depends_list = [str(depends_on)] if depends_on else []
+        normalized = {"depends_on": depends_list, "formula": str(formula)}
+        dependencies_map[str(key)] = normalized
+        added_dependencies[str(key)] = normalized
+
+    return added_rules, added_dependencies
 
 
 def _build_config_overview(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -647,6 +957,7 @@ def generate_synthetic_data_action(
     profile_file,
     business_rules_text,
     profile_text,
+    bias_prompt,
     variation,
     lines,
     ratio,
@@ -712,6 +1023,8 @@ def generate_synthetic_data_action(
 
     business_rules_content = (business_rules_text or "").strip()
     profile_content = (profile_text or "").strip()
+    bias_prompt_content = (bias_prompt or "").strip()
+    use_gpt = bool(gpt_enabled) and bool(gpt_key)
 
     business_rules_path = Path(business_rules_file.name) if business_rules_file is not None else None
     profile_path = Path(profile_file.name) if profile_file is not None else None
@@ -727,6 +1040,52 @@ def generate_synthetic_data_action(
     synth_logger.addHandler(log_handler)
     if synth_logger.level > logging.INFO or synth_logger.level == 0:
         synth_logger.setLevel(logging.INFO)
+
+    # Merge bias prompt rules before writing override files
+    if bias_prompt_content:
+        if not use_gpt:
+            error_msg = (
+                "Bias-Prompts benötigen GPT (API-Key + Aktivierung). Bitte aktiviere GPT oder entferne den Prompt."
+            )
+            log_capture.append(f"ERROR {error_msg}")
+            return error_msg, None, None, None, "\n".join(log_capture), state
+
+        columns_for_prompt = _collect_excel_columns(base_path)
+        config_data, business_section = _parse_business_rules_block(business_rules_content or "")
+        existing_rules = []
+        rules_section = business_section.get("rules") if isinstance(business_section, dict) else None
+        if isinstance(rules_section, list):
+            existing_rules = [str(rule.get("name")) for rule in rules_section if isinstance(rule, dict) and rule.get("name")]
+        try:
+            llm_payload = _call_bias_llm(
+                prompt=bias_prompt_content,
+                columns=columns_for_prompt,
+                existing_rule_names=existing_rules,
+                model=gpt_model or "gpt-5-mini",
+                api_key=gpt_key or "",
+            )
+        except BiasPromptError as exc:
+            message = f"Bias-Prompt konnte nicht interpretiert werden: {exc}"
+            log_capture.append(f"ERROR {message}")
+            return message, None, None, None, "\n".join(log_capture), state
+
+        normalized_patch = _normalise_bias_patch(llm_payload)
+        added_rules, added_dependencies = _apply_bias_patch(config_data, business_section, normalized_patch)
+        business_rules_content = yaml.safe_dump(
+            config_data,
+            sort_keys=False,
+            allow_unicode=True,
+        )
+        if added_rules or added_dependencies:
+            bias_snippet = yaml.safe_dump(
+                {"business_rules": {"rules": added_rules, "dependencies": added_dependencies}},
+                sort_keys=False,
+                allow_unicode=True,
+            ).strip()
+            log_capture.append("INFO Bias-Regeln übernommen:\n" + bias_snippet)
+            state["bias_rules_yaml"] = bias_snippet
+        else:
+            log_capture.append("INFO Bias-Prompt lieferte keine zusätzlichen Regeln.")
 
     if business_rules_content:
         business_rules_path = tmp_dir / "business_rules_override.yaml"
@@ -757,7 +1116,6 @@ def generate_synthetic_data_action(
         args.extend(["--profile", str(profile_path)])
     args.extend(["--quality-report", str(quality_path)])
 
-    use_gpt = bool(gpt_enabled) and bool(gpt_key)
     if use_gpt:
         args.extend(["--gpt-model", gpt_model or "gpt-5-mini"])
         args.extend(["--openai-api-key", gpt_key])
@@ -1576,6 +1934,15 @@ def build_interface() -> gr.Blocks:
                     value=default_profile_text,
                 )
                 gr.HTML(_tooltip_label(
+                    "Bias-Prompt (optional)",
+                    "Natürliche Sprache → zusätzliche Regeln. Beispiel: 'Erhöhe Ampel Gelb um 5 %, wenn Belegdatum ein Montag ist.' Erfordert GPT."
+                ))
+                synth_bias_prompt = gr.Textbox(
+                    show_label=False,
+                    placeholder="Beschreibe gewünschte Tendenzen für die synthetischen Daten",
+                    lines=4,
+                )
+                gr.HTML(_tooltip_label(
                     "Variation",
                     "0 = minimale Mutationen (Original fast kopiert), 1 = starke Abweichungen (neue Texte/Beträge). Beispiel: 0.3 erzeugt leichte Textvarianten."
                 ))
@@ -1622,6 +1989,7 @@ def build_interface() -> gr.Blocks:
                     "Schreibt detaillierte Synthesizer-Logs (z. B. pro Tabelle). Hilfreich beim Debugging, erzeugt aber mehr Output."
                 ))
                 synth_debug = gr.Checkbox(show_label=False, value=False)
+                synth_bias_prompt.info = "Verwendet GPT, um Wahrscheinlichkeiten z. B. anhand von Wochentagen oder Betragsmustern anzupassen."
                 synth_gpt_model.info = "Welches OpenAI-Modell für Textplausibilisierung genutzt wird."
                 synth_gpt_key.info = "API-Key nur nötig, wenn GPT aktiv ist. Wird temporär gesetzt und nach dem Lauf wieder entfernt."
                 synth_debug.info = "Schreibt detaillierte Fortschrittslogs (z. B. pro Tabelle). Gut zum Troubleshooting, verlängert ggf. den Output."
@@ -1665,6 +2033,7 @@ def build_interface() -> gr.Blocks:
                 synth_profile,
                 synth_business_rules_text,
                 synth_profile_text,
+                synth_bias_prompt,
                 synth_variation,
                 synth_lines,
                 synth_ratio,

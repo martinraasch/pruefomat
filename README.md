@@ -104,7 +104,13 @@ Open the printed URL (e.g. `http://127.0.0.1:7860`) in your browser. You will se
 
 All downloads appear as clickable files below each action.
 
-### Tab 2 – Batch Prediction
+### Tab 2 – Synthetische Daten
+- Wähle eine Excel-Referenzdatei. Die Struktur und Wertebereiche dienen als Grundlage für synthetische Zeilen.
+- Passe optional Business-Rules- oder Profil-YAML direkt im Editor an, statt separate Dateien hochzuladen.
+- Nutze das neue **Bias-Prompt**-Feld, um natürliche Sprache in Wahrscheinlichkeitsregeln zu verwandeln (z. B. "Erhöhe Ampel Gelb um 5 %, wenn Belegdatum ein Montag ist"). Dafür muss GPT aktiviert sein und ein OpenAI-Key hinterlegt werden.
+- Steuere Variation, Zielzeilen/Ratio sowie Seed und starte die Generierung. Log, Vorschau, Download und Quality Report stehen anschließend als Outputs bereit.
+
+### Tab 3 – Batch Prediction
 - Upload a large Excel file (no labels required).
 - Click **Belege prüfen**. The app shows a progress bar and produces an Excel download with added `fraud_score` (0–100) and `prediction` columns.
 
