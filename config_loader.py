@@ -6,7 +6,7 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -66,6 +66,38 @@ class AppConfig(BaseModel):
     data: DataSection = Field(default_factory=DataSection)
     preprocessing: PreprocessingSection = Field(default_factory=PreprocessingSection)
     model: ModelSection = Field(default_factory=ModelSection)
+    pattern_analysis: "PatternAnalysisSection" = Field(default_factory=lambda: PatternAnalysisSection())
+
+
+class NumericFeatureOptions(BaseModel):
+    is_round: List[int] = Field(default_factory=lambda: [0, 2])
+    quantiles: List[float] = Field(default_factory=lambda: [0.25, 0.5, 0.75])
+    zero_check: bool = True
+    extreme_percentile: float = 0.98
+
+
+class CategoricalFeatureOptions(BaseModel):
+    top_k: int = 10
+    include_other: bool = True
+
+
+class TextFeatureOptions(BaseModel):
+    length_buckets: List[int] = Field(default_factory=lambda: [50, 200])
+    non_empty: bool = True
+
+
+class PatternAnalysisSection(BaseModel):
+    date_features: List[str] = Field(
+        default_factory=lambda: ["weekday", "is_weekend", "month", "quarter"]
+    )
+    numeric_features: NumericFeatureOptions = Field(default_factory=NumericFeatureOptions)
+    categorical_features: CategoricalFeatureOptions = Field(default_factory=CategoricalFeatureOptions)
+    text_features: TextFeatureOptions = Field(default_factory=TextFeatureOptions)
+    min_lift: float = 1.15
+    min_samples: int = 20
+    max_p_value: float = 0.05
+    max_feature_values: int = 30
+    top_n: int = 40
 
 
 class ConfigError(RuntimeError):
@@ -143,4 +175,5 @@ __all__ = [
     "RandomForestConfig",
     "load_config",
     "normalize_config_columns",
+    "PatternAnalysisSection",
 ]

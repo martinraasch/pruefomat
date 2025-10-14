@@ -74,6 +74,12 @@ from build_pipeline_veri import (
     normalize_columns,
 )
 from logging_utils import configure_logging, get_logger, mask_sensitive_data
+from src.patterns import (
+    ConditionalProbabilityAnalyzer,
+    FeatureTypeDetector,
+    InsightFormatter,
+    InterpretableFeatureGenerator,
+)
 
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -453,8 +459,26 @@ def _call_bias_llm(
                     {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                     {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
                 ],
-                max_output_tokens=2048,
+                response_format={"type": "json_object"},
+                max_output_tokens=1024,
             )
+        except TypeError as exc:
+            if "response_format" in str(exc):
+                try:
+                    response = client.responses.create(
+                        model=model,
+                        input=[
+                            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+                        ],
+                        max_output_tokens=1024,
+                    )
+                except Exception as inner_exc:  # pragma: no cover - runtime variability
+                    last_exc = inner_exc
+                    response = None
+            else:
+                last_exc = exc
+                response = None
         except Exception as exc:  # pragma: no cover - runtime variability
             last_exc = exc
             response = None
@@ -472,8 +496,7 @@ def _call_bias_llm(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=1200,
-                temperature=0,
+                max_completion_tokens=1200,
             )
             text = _extract_response_text(response)
         except Exception as exc:  # pragma: no cover - runtime variability
@@ -489,6 +512,26 @@ def _call_bias_llm(
     text = text or _extract_response_text(response)
     json_text = _extract_json_block(text) if text else None
     candidate = json_text or text
+    if not candidate and hasattr(client, "responses"):
+        try:
+            retry_resp = client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+                ],
+                response_format={"type": "json_object"},
+                max_output_tokens=512,
+            )
+            retry_text = _extract_response_text(retry_resp)
+            json_text = _extract_json_block(retry_text) if retry_text else None
+            candidate = json_text or retry_text
+            if candidate:
+                response = retry_resp
+                text = retry_text
+        except Exception:
+            pass
+
     if not candidate:
         raw_dump = None
         if hasattr(response, "model_dump"):
@@ -503,6 +546,9 @@ def _call_bias_llm(
             "LLM lieferte kein gültiges JSON zurück. Prompt:\n"
             f"{prompt.strip()}\nAntwort-Auszug:\n{raw_excerpt}"
         )
+    candidate = candidate.strip()
+    candidate = _repair_json_candidate(candidate)
+
     try:
         payload = json.loads(candidate)
     except json.JSONDecodeError as exc:
@@ -518,6 +564,10 @@ def _call_bias_llm(
                 "LLM lieferte kein gültiges JSON zurück. Prompt:\n"
                 f"{prompt.strip()}\nAntwort-Auszug:\n{candidate.strip()}"
             ) from exc
+        json_text = json_text or yaml.safe_dump(payload)
+
+    if not json_text and isinstance(payload, dict):
+        json_text = json.dumps(payload, ensure_ascii=False)
 
     if isinstance(payload, list):
         payload = {"rules": payload}
@@ -528,6 +578,23 @@ def _call_bias_llm(
             f"{prompt.strip()}\nAntwort-Auszug:\n{candidate.strip()}"
         )
     return payload
+
+
+def _repair_json_candidate(candidate: str) -> str:
+    trimmed = candidate.strip()
+    if not trimmed:
+        return trimmed
+    # drop trailing unmatched quote
+    if trimmed.endswith('"') and trimmed.count('"') % 2 == 1:
+        trimmed = trimmed[:-1]
+    # balance brackets
+    diff_curly = trimmed.count('{') - trimmed.count('}')
+    if diff_curly > 0:
+        trimmed += '}' * diff_curly
+    diff_bracket = trimmed.count('[') - trimmed.count(']')
+    if diff_bracket > 0:
+        trimmed += ']' * diff_bracket
+    return trimmed
 
 
 def _normalise_bias_patch(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1953,6 +2020,69 @@ def feedback_fp_action(state, row_index, user, comment):
     return feedback_action(state, row_index, user, comment, "FP")
 
 
+def analyze_patterns_action(state: Optional[Dict[str, Any]]):
+    state = state or {}
+    df_features = state.get("df_features")
+    target = state.get("target")
+    target_name = state.get("target_name")
+    if df_features is None or target is None:
+        logger.warning("ui_patterns_no_data")
+        return "Bitte zuerst Baseline trainieren.", None, None, state
+
+    if df_features.empty or len(target) == 0:
+        return "Keine Daten für Musteranalyse vorhanden.", None, None, state
+
+    config = _ensure_config(state)
+
+    detector = FeatureTypeDetector(config)
+    feature_infos = detector.detect(df_features)
+    generator = InterpretableFeatureGenerator(config)
+    generated = generator.generate(df_features, feature_infos)
+    if not generated:
+        return "Keine interpretierbaren Merkmale generiert.", None, None, state
+
+    target_mapping = state.get("target_mapping") or {}
+    inverse_mapping = {int(v): str(k) for k, v in target_mapping.items()} if target_mapping else None
+
+    analyzer = ConditionalProbabilityAnalyzer(config)
+    insights = analyzer.analyze(generated, pd.Series(target).reset_index(drop=True), inverse_mapping)
+    if not insights:
+        return "Keine signifikanten Muster gefunden.", None, None, state
+
+    formatter = InsightFormatter(target_name=target_name)
+    lines = formatter.format_many(insights)
+    markdown = "\n".join(f"- {line}" for line in lines)
+
+    df_rows = [
+        {
+            "feature": insight.feature_description,
+            "value": insight.feature_value_label,
+            "target": insight.target_value,
+            "probability": insight.probability,
+            "baseline": insight.baseline_probability,
+            "lift": insight.lift,
+            "delta": insight.delta,
+            "support": insight.support,
+            "population": insight.population,
+            "support_ratio": insight.support_ratio,
+            "p_value": insight.p_value,
+            "chi2": insight.chi2,
+        }
+        for insight in insights
+    ]
+    df_out = pd.DataFrame(df_rows)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_patterns_"))
+    csv_path = tmp_dir / "pattern_insights.csv"
+    df_out.to_csv(csv_path, index=False)
+
+    state["pattern_insights_df"] = df_out
+    state["pattern_insights_path"] = str(csv_path)
+
+    status = f"{len(insights)} Muster gefunden."
+    return status, markdown, str(csv_path), state
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -2037,6 +2167,10 @@ def build_interface() -> gr.Blocks:
                 report_status = gr.Textbox(label="Report-Status", interactive=False)
                 report_preview = gr.Markdown(label="Report Vorschau")
                 report_download = gr.File(label="Report Download", interactive=False)
+                pattern_btn = gr.Button("Musteranalyse starten")
+                pattern_status = gr.Textbox(label="Muster-Status", interactive=False)
+                pattern_preview = gr.Markdown(label="Automatisch erkannte Muster")
+                pattern_download = gr.File(label="Muster Download", interactive=False)
                 feedback_user = gr.Textbox(label="Prüfer:in", value="")
                 feedback_comment = gr.Textbox(label="Feedback-Kommentar", lines=2)
                 feedback_index = gr.Number(label="Zeilenindex (Feedback)", value=0, precision=0)
@@ -2101,6 +2235,23 @@ def build_interface() -> gr.Blocks:
                     value=default_profile_text,
                 )
                 gr.HTML(_tooltip_label(
+                    "GPT-Verfeinerung verwenden",
+                    "Aktiviert sprachliche Verfeinerung (z. B. plausiblere Hinweise). Erhöht Laufzeit und API-Kosten."
+                ))
+                synth_gpt_enable = gr.Checkbox(show_label=False, value=True)
+                gr.HTML(_tooltip_label(
+                    "GPT-Modell",
+                    "Welches OpenAI-Modell für Textplausibilisierung und Bias-Regeln genutzt wird."
+                ))
+                synth_gpt_model = gr.Dropdown(choices=["gpt-5-mini", "gpt-5", "gpt-4.1-mini"], value="gpt-5-mini", show_label=False)
+
+                gr.HTML(_tooltip_label(
+                    "OpenAI API Key",
+                    "Nur notwendig, wenn GPT aktiviert ist. Der Key wird während des Laufs gesetzt und danach entfernt."
+                ))
+                synth_gpt_key = gr.Textbox(type="password", show_label=False)
+
+                gr.HTML(_tooltip_label(
                     "Bias-Prompt (optional)",
                     "Natürliche Sprache → zusätzliche Regeln. Beispiel: 'Erhöhe Ampel Gelb um 5 %, wenn Belegdatum ein Montag ist.' Erfordert GPT."
                 ))
@@ -2142,23 +2293,6 @@ def build_interface() -> gr.Blocks:
                             "Deterministischer Zufalls-Seed. Gleiche Eingaben + Seed → reproduzierbare Ergebnisse."
                         ))
                         synth_seed = gr.Number(value=1234, precision=0, show_label=False)
-
-                gr.HTML(_tooltip_label(
-                    "GPT-Verfeinerung verwenden",
-                    "Aktiviert sprachliche Verfeinerung (z. B. plausiblere Hinweise). Erhöht Laufzeit und API-Kosten."
-                ))
-                synth_gpt_enable = gr.Checkbox(show_label=False, value=True)
-                gr.HTML(_tooltip_label(
-                    "GPT-Modell",
-                    "Welches OpenAI-Modell für Textplausibilisierung genutzt wird."
-                ))
-                synth_gpt_model = gr.Dropdown(choices=["gpt-5-mini", "gpt-5", "gpt-4.1-mini"], value="gpt-5-mini", show_label=False)
-
-                gr.HTML(_tooltip_label(
-                    "OpenAI API Key",
-                    "Nur notwendig, wenn GPT-Verfeinerung aktiv ist. Der Key wird während des Laufs gesetzt und danach entfernt."
-                ))
-                synth_gpt_key = gr.Textbox(type="password", show_label=False)
 
                 gr.HTML(_tooltip_label(
                     "Debug-Logging aktivieren",
@@ -2278,6 +2412,12 @@ def build_interface() -> gr.Blocks:
             generate_pattern_report_action,
             inputs=[state],
             outputs=[report_status, report_preview, report_download, state],
+        )
+
+        pattern_btn.click(
+            analyze_patterns_action,
+            inputs=[state],
+            outputs=[pattern_status, pattern_preview, pattern_download, state],
         )
 
         feedback_tp_btn.click(
