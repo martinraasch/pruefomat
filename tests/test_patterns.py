@@ -1,7 +1,7 @@
 import pandas as pd
 
 from config_loader import AppConfig
-from app import analyze_patterns_action
+from app import analyze_patterns_action, generate_bias_rules_action, BiasPromptError
 from src.patterns import (
     ConditionalProbabilityAnalyzer,
     FeatureTypeDetector,
@@ -63,3 +63,42 @@ def test_analyze_patterns_action(tmp_path):
     assert markdown is not None
     assert csv_path is not None
     assert new_state.get("pattern_insights_df") is not None
+
+
+def test_generate_bias_rules_action_fallback(monkeypatch, tmp_path):
+    def fail_call(**kwargs):
+        raise BiasPromptError("LLM failed")
+
+    monkeypatch.setattr("app._call_bias_llm", fail_call)
+
+    df_features = pd.DataFrame(
+        {
+            "DEB_Name": ["Muster GmbH", "AG"],
+            "Betrag": [100.0, 200.0],
+        }
+    )
+    excel_path = tmp_path / "dummy.xlsx"
+    df_features.to_excel(excel_path, index=False)
+
+    state = {
+        "df_features": df_features,
+        "target_name": "Ampel",
+    }
+
+    class DummyFile:
+        def __init__(self, name):
+            self.name = name
+
+    status, yaml_text, new_state = generate_bias_rules_action(
+        state,
+        "Erhöhe rot um 40% wenn GmbH",
+        "",
+        DummyFile(str(excel_path)),
+        True,
+        "gpt-5-mini",
+        "sk-test",
+    )
+
+    assert "Bias-Regeln generiert" in status
+    assert "GmbH" in yaml_text
+    assert new_state.get("bias_rules_yaml")

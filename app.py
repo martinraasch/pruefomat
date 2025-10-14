@@ -448,68 +448,43 @@ def _call_bias_llm(
         """
     ).strip()
 
-    response = None
-    last_exc: Exception | None = None
+    if not hasattr(client, "responses"):
+        raise BiasPromptError(
+            "Das konfigurierte Modell unterstützt die Responses API nicht – Bias-Prompts stehen daher nicht zur Verfügung."
+        )
 
-    if hasattr(client, "responses"):
-        try:
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
+            ],
+            response_format={"type": "json_object"},
+            max_output_tokens=256,
+            parallel_tool_calls=False,
+            tool_choice="none",
+            reasoning={"effort": "low"},
+        )
+    except TypeError as exc:
+        if "response_format" in str(exc):
             response = client.responses.create(
                 model=model,
                 input=[
                     {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                     {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
                 ],
-                response_format={"type": "json_object"},
-                max_output_tokens=1024,
+                max_output_tokens=256,
+                parallel_tool_calls=False,
+                tool_choice="none",
+                reasoning={"effort": "low"},
             )
-        except TypeError as exc:
-            if "response_format" in str(exc):
-                try:
-                    response = client.responses.create(
-                        model=model,
-                        input=[
-                            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-                            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-                        ],
-                        max_output_tokens=1024,
-                    )
-                except Exception as inner_exc:  # pragma: no cover - runtime variability
-                    last_exc = inner_exc
-                    response = None
-            else:
-                last_exc = exc
-                response = None
-        except Exception as exc:  # pragma: no cover - runtime variability
-            last_exc = exc
-            response = None
+        else:
+            raise BiasPromptError(f"OpenAI-Anfrage fehlgeschlagen: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - runtime variability
+        raise BiasPromptError(f"OpenAI-Anfrage fehlgeschlagen: {exc}") from exc
 
-    text = _extract_response_text(response) if response is not None else None
-    if (
-        not text
-        and hasattr(client, "chat")
-        and hasattr(getattr(client, "chat"), "completions")
-    ):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_completion_tokens=1200,
-            )
-            text = _extract_response_text(response)
-        except Exception as exc:  # pragma: no cover - runtime variability
-            last_exc = exc
-            response = None
-            text = None
-
-    if response is None and last_exc is not None:
-        raise BiasPromptError(f"OpenAI-Anfrage fehlgeschlagen: {last_exc}") from last_exc
-    if response is None:
-        raise BiasPromptError("OpenAI-Anfrage lieferte keine Antwort.")
-
-    text = text or _extract_response_text(response)
+    text = _extract_response_text(response)
     json_text = _extract_json_block(text) if text else None
     candidate = json_text or text
     if not candidate and hasattr(client, "responses"):
