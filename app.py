@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import sys
 import logging
+import re
 
 SKIP_GRADIO_IMPORT = os.environ.get("PRUEFOMAT_DISABLE_GRADIO") == "1"
 
@@ -133,6 +134,7 @@ def ensure_feedback_db():
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG_PATH = Path("config/default_config.yaml")
+BIAS_PROMPT_MODEL = "gpt-4.1-mini"
 
 
 def _load_app_config(path: Optional[str | Path]) -> AppConfig:
@@ -404,6 +406,7 @@ def _call_bias_llm(
     model: str,
     api_key: str,
 ) -> Dict[str, Any]:
+    model = BIAS_PROMPT_MODEL
     try:
         from openai import OpenAI  # type: ignore
     except ImportError as exc:  # pragma: no cover - optional dependency
@@ -453,6 +456,50 @@ def _call_bias_llm(
             "Das konfigurierte Modell unterstützt die Responses API nicht – Bias-Prompts stehen daher nicht zur Verfügung."
         )
 
+    json_schema = {
+        "name": "bias_rules",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "rules": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "columns": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 1,
+                            },
+                            "condition": {"type": "string"},
+                        },
+                        "required": ["name", "columns", "condition"],
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                },
+                "dependencies": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "formula": {"type": "string"},
+                        },
+                        "required": ["formula"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["rules"],
+            "additionalProperties": False,
+        },
+    }
+
     try:
         response = client.responses.create(
             model=model,
@@ -460,11 +507,10 @@ def _call_bias_llm(
                 {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
                 {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
             ],
-            response_format={"type": "json_object"},
+            response_format={"type": "json_schema", "json_schema": json_schema},
             max_output_tokens=256,
             parallel_tool_calls=False,
             tool_choice="none",
-            reasoning={"effort": "low"},
         )
     except TypeError as exc:
         if "response_format" in str(exc):
@@ -477,7 +523,6 @@ def _call_bias_llm(
                 max_output_tokens=256,
                 parallel_tool_calls=False,
                 tool_choice="none",
-                reasoning={"effort": "low"},
             )
         else:
             raise BiasPromptError(f"OpenAI-Anfrage fehlgeschlagen: {exc}") from exc
@@ -570,6 +615,115 @@ def _repair_json_candidate(candidate: str) -> str:
     if diff_bracket > 0:
         trimmed += ']' * diff_bracket
     return trimmed
+
+
+def _heuristic_bias_from_prompt(
+    prompt: str,
+    columns: List[str],
+    df_features: Optional[pd.DataFrame],
+    target_name: str,
+) -> Dict[str, Any]:
+    text_lower = prompt.lower()
+    prob_match = re.search(r"(\d+[\.,]?\d*)\s*%", text_lower)
+    probability = 0.5
+    if prob_match:
+        value = prob_match.group(1).replace(",", ".")
+        try:
+            probability = float(value)
+            if probability > 1.0:
+                probability /= 100.0
+        except ValueError:
+            probability = 0.5
+    else:
+        fraction_match = re.search(r"(\d+[\.,]?\d*)\s*(?:fach|mal)", text_lower)
+        if fraction_match:
+            try:
+                probability = float(fraction_match.group(1))
+                if probability > 1.0:
+                    probability = min(probability / 2.0, 1.0)
+            except ValueError:
+                probability = 0.5
+
+    probability = max(0.01, min(probability, 1.0))
+
+    target_map = {
+        "rot": "3",
+        "gelb": "2",
+        "grün": "1",
+        "gruen": "1",
+    }
+    target_values: List[str] = []
+    for word, mapped in target_map.items():
+        if word in text_lower:
+            target_values.append(mapped)
+    if not target_values:
+        target_values = ["3"]
+
+    condition_text = prompt
+    match_wenn = re.search(r"(?:wenn|if)\s+(.+)", prompt, flags=re.IGNORECASE)
+    if match_wenn:
+        condition_text = match_wenn.group(1).strip().rstrip(".")
+
+    preferred_keywords = [
+        "name",
+        "firma",
+        "company",
+        "deb",
+        "kunde",
+        "customer",
+        "type",
+    ]
+
+    candidate_columns: List[str] = []
+
+    def _add_candidate(raw_name: str) -> None:
+        if not raw_name:
+            return
+        normalized = normalize_column_name(raw_name) or raw_name
+        if normalized not in candidate_columns:
+            candidate_columns.append(normalized)
+
+    for col in columns:
+        lower_col = col.lower()
+        if any(keyword in lower_col for keyword in preferred_keywords):
+            _add_candidate(col)
+    if df_features is not None:
+        for col in df_features.columns:
+            lower_col = str(col).lower()
+            if any(keyword in lower_col for keyword in preferred_keywords):
+                _add_candidate(str(col))
+    if not candidate_columns and columns:
+        _add_candidate(columns[0])
+
+    condition_parts = []
+    negation_regex = re.compile(r"(kein|keine|keinen|ohne|nicht)\s+[^.,;]*gmbh")
+    has_gmbh = "gmbh" in text_lower
+    is_negated = bool(negation_regex.search(text_lower))
+
+    if has_gmbh:
+        token = '"GmbH"'
+        operator = "not in" if is_negated else "in"
+        for col in candidate_columns[:1]:
+            condition_parts.append(f"{token} {operator} {col}")
+    elif candidate_columns:
+        condition_parts.append(f"{candidate_columns[0]} != ''")
+    else:
+        condition_parts.append("True")
+
+    condition_expr = " and ".join(condition_parts)
+    rule_name = prompt.strip().split("\n")[0][:60] or "Bias Regel"
+
+    target_column_normalized = normalize_column_name(target_name) or target_name
+    columns_used = candidate_columns[:1] + [target_column_normalized]
+    deduped_columns = list(dict.fromkeys(columns_used))
+
+    rule = {
+        "name": rule_name,
+        "columns": deduped_columns,
+        "condition": f"if {condition_expr} then {target_name} in [{', '.join(target_values)}] with probability {probability}",
+    }
+
+    return {"rules": [rule], "dependencies": {}}
 
 
 def _normalise_bias_patch(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1137,16 +1291,26 @@ def generate_bias_rules_action(
         else []
     )
 
+    df_features = state.get("df_features")
+
     try:
         payload = _call_bias_llm(
             prompt=prompt_clean,
             columns=columns,
             existing_rule_names=existing_rule_names,
-            model=gpt_model or "gpt-5-mini",
+            model=BIAS_PROMPT_MODEL,
             api_key=gpt_key or "",
         )
+        failure_hint = ""
     except BiasPromptError as exc:
-        return str(exc), existing_yaml, state
+        failure_hint = str(exc)
+        target_name = state.get("target_name") or "Ampel"
+        payload = _heuristic_bias_from_prompt(
+            prompt_clean,
+            columns,
+            df_features,
+            target_name,
+        )
 
     normalized_patch = _normalise_bias_patch(payload)
     added_rules, added_dependencies = _apply_bias_patch(config_data, business_section, normalized_patch)
@@ -1170,6 +1334,8 @@ def generate_bias_rules_action(
     )
 
     status = f"Bias-Regeln generiert ({rule_count} Regeln, {dep_count} Abhängigkeiten)."
+    if failure_hint:
+        status += " Hinweis: " + failure_hint
 
     return status, bias_yaml, state
 
@@ -1872,20 +2038,31 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     if upload is None:
         return "Bitte eine Excel-Datei hochladen.", None
 
-    with gr.Progress(track_tqdm=False) as progress:
-        progress(0.05, desc="Lade Datei")
-        df_input = pd.read_excel(upload.name)
-        progress(0.3, desc="Berechne Scores")
-        scores = model.predict_proba(df_input)[:, -1]
-        predictions = (scores >= 0.5).astype(int)
-        df_out = df_input.copy()
-        df_out["fraud_score"] = scores * 100.0
-        df_out["prediction"] = predictions
-        progress(0.8, desc="Schreibe Ergebnis")
-        tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_batch_"))
-        out_path = tmp_dir / "batch_predictions.xlsx"
-        df_out.to_excel(out_path, index=False)
-        progress(1.0, desc="Fertig")
+    progress = gr.Progress(track_tqdm=False)
+    progress(0.05, desc="Lade Datei")
+    df_input_raw = pd.read_excel(upload.name)
+    df_input, _ = normalize_columns(df_input_raw)
+    config = _ensure_config(state)
+    target_col = config.data.target_col
+    if target_col and target_col in df_input.columns:
+        df_input = df_input.drop(columns=[target_col])
+    selected_columns = state.get("selected_columns") or list(df_input.columns)
+    missing = [col for col in selected_columns if col not in df_input.columns]
+    for col in missing:
+        df_input[col] = np.nan
+    df_input = df_input[selected_columns]
+
+    progress(0.3, desc="Berechne Scores")
+    scores = model.predict_proba(df_input)[:, -1]
+    predictions = (scores >= 0.5).astype(int)
+    df_out = df_input.copy()
+    df_out["fraud_score"] = scores * 100.0
+    df_out["prediction"] = predictions
+    progress(0.8, desc="Schreibe Ergebnis")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_batch_"))
+    out_path = tmp_dir / "batch_predictions.xlsx"
+    df_out.to_excel(out_path, index=False)
+    progress(1.0, desc="Fertig")
 
     logger.info(
         "ui_batch_prediction_completed",
