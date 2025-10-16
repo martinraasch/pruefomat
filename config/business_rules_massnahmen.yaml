@@ -1,6 +1,6 @@
 business_rules:
   version: "1.0"
-
+  rules:
   # Regel 1: Grüne Ampel + niedriger Betrag
   - name: "niedrig_betrag_gruene_ampel"
     priority: 1

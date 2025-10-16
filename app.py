@@ -63,6 +63,7 @@ from sklearn.metrics import (balanced_accuracy_score, classification_report,
                              recall_score, fbeta_score)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder
 
 from config_loader import AppConfig, ConfigError, load_config, normalize_config_columns
 from build_pipeline_veri import (
@@ -82,6 +83,10 @@ from src.patterns import (
     InsightFormatter,
     InterpretableFeatureGenerator,
 )
+from src.business_rules import BusinessRule, load_business_rules_from_file
+from src.rule_engine import RuleEngine
+from src.hybrid_predictor import HybridMassnahmenPredictor
+from src.train_massnahmen import evaluate_multiclass
 
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -104,6 +109,7 @@ except Exception:  # pragma: no cover - optional dependency
 DEFAULT_SYNTH_CONFIG = DATA_SYNTH_ROOT / "configs" / "default.yaml"
 DEFAULT_BUSINESS_RULES_PATH = DATA_SYNTH_ROOT / "configs" / "business_rules.yaml"
 DEFAULT_PROFILE_PATH = DATA_SYNTH_ROOT / "configs" / "invoice_profile.yaml"
+MASSNAHMEN_RULES_PATH = Path("config/business_rules_massnahmen.yaml")
 
 AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "negativ", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
 
@@ -1034,7 +1040,7 @@ def _balance_training_set(
             balanced_parts.append(subset)
     balanced_df = pd.concat(balanced_parts, ignore_index=True)
     y_balanced = balanced_df.pop("__target__")
-    return balanced_df, y_balanced.astype(int)
+    return balanced_df.reset_index(drop=True), y_balanced.reset_index(drop=True)
 
 
 def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folder_text: str, state: Optional[Dict[str, Any]]):
@@ -1119,56 +1125,73 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
     target_mapping: Dict[str, int] | None = None
     state.pop("target_mapping", None)
     target_msg = "Keine Zielspalte gesetzt."
+    mass_target_norm = normalize_column_name("Massnahme_2025")
+
     if target_norm and target_norm in df_norm_all.columns:
-        target_numeric = pd.to_numeric(df_norm_all[target_norm], errors="coerce")
-        mask = target_numeric.notna()
-        if mask.any():
-            target_series = target_numeric.loc[mask].astype(int)
-            df_features = df_norm_all.loc[mask].drop(columns=[target_norm])
-            target_msg = f"Zielspalte erkannt: {target_norm}"
-            logger.info("ui_target_detected", target=target_norm)
-        else:
-            raw_strings = df_norm_all[target_norm].astype("string").str.strip()
-            raw_strings = raw_strings.replace({"": pd.NA})
-
-            def _encode_target_strings(series: pd.Series) -> tuple[pd.Series, Dict[str, int]]:
-                series = series.astype("string")
-                series = series.replace({"": pd.NA})
-                if series.notna().sum() == 0:
-                    return series.astype("Int64"), {}
-                known_map = {
-                    "grün": 1,
-                    "gruen": 1,
-                    "gelb": 2,
-                    "rot": 3,
-                }
-                lower = series.str.lower()
-                if lower.dropna().isin(known_map).all():
-                    mapped = lower.map(known_map).astype("Int64")
-                    mapping: Dict[str, int] = {}
-                    for value in series.dropna().unique():
-                        mapping[str(value)] = known_map[str(value).lower()]
-                    return mapped, mapping
-                valid = series.dropna()
-                codes, uniques = pd.factorize(valid, sort=True)
-                mapping = {str(cat): int(idx + 1) for idx, cat in enumerate(uniques)}
-                mapped = pd.Series(pd.NA, index=series.index, dtype="Int64")
-                mapped.loc[valid.index] = codes + 1
-                return mapped, mapping
-
-            encoded_series, mapping = _encode_target_strings(raw_strings)
-            mask_encoded = encoded_series.notna()
-            if mask_encoded.any():
-                target_series = encoded_series.loc[mask_encoded].astype(int)
-                df_features = df_norm_all.loc[mask_encoded].drop(columns=[target_norm])
-                target_msg = f"Zielspalte erkannt: {target_norm} (kategorisch)"
+        if target_norm == mass_target_norm:
+            raw_target = df_norm_all[target_norm].astype("string").str.strip()
+            raw_target = raw_target.replace({"": pd.NA})
+            mask_mass = raw_target.notna()
+            if mask_mass.any():
+                target_series = raw_target.loc[mask_mass]
+                df_features = df_norm_all.loc[mask_mass].drop(columns=[target_norm])
+                target_msg = f"Zielspalte erkannt: {target_norm} (mehrklassig)"
                 logger.info("ui_target_detected", target=target_norm)
-                if mapping:
-                    target_mapping = mapping
+                state["target_mapping"] = {str(val): str(val) for val in target_series.dropna().unique()}
             else:
                 target_msg = f"Zielspalte '{target_norm}' enthält keine nutzbaren Werte."
                 df_features = df_norm_all.drop(columns=[target_norm])
                 logger.warning("ui_target_empty", target=target_norm)
+        else:
+            target_numeric = pd.to_numeric(df_norm_all[target_norm], errors="coerce")
+            mask = target_numeric.notna()
+            if mask.any():
+                target_series = target_numeric.loc[mask].astype(int)
+                df_features = df_norm_all.loc[mask].drop(columns=[target_norm])
+                target_msg = f"Zielspalte erkannt: {target_norm}"
+                logger.info("ui_target_detected", target=target_norm)
+            else:
+                raw_strings = df_norm_all[target_norm].astype("string").str.strip()
+                raw_strings = raw_strings.replace({"": pd.NA})
+
+                def _encode_target_strings(series: pd.Series) -> tuple[pd.Series, Dict[str, int]]:
+                    series = series.astype("string")
+                    series = series.replace({"": pd.NA})
+                    if series.notna().sum() == 0:
+                        return series.astype("Int64"), {}
+                    known_map = {
+                        "grün": 1,
+                        "gruen": 1,
+                        "gelb": 2,
+                        "rot": 3,
+                    }
+                    lower = series.str.lower()
+                    if lower.dropna().isin(known_map).all():
+                        mapped = lower.map(known_map).astype("Int64")
+                        mapping: Dict[str, int] = {}
+                        for value in series.dropna().unique():
+                            mapping[str(value)] = known_map[str(value).lower()]
+                        return mapped, mapping
+                    valid = series.dropna()
+                    codes, uniques = pd.factorize(valid, sort=True)
+                    mapping = {str(cat): int(idx + 1) for idx, cat in enumerate(uniques)}
+                    mapped = pd.Series(pd.NA, index=series.index, dtype="Int64")
+                    mapped.loc[valid.index] = codes + 1
+                    return mapped, mapping
+
+                encoded_series, mapping = _encode_target_strings(raw_strings)
+                mask_encoded = encoded_series.notna()
+                if mask_encoded.any():
+                    target_series = encoded_series.loc[mask_encoded].astype(int)
+                    df_features = df_norm_all.loc[mask_encoded].drop(columns=[target_norm])
+                    target_msg = f"Zielspalte erkannt: {target_norm} (kategorisch)"
+                    logger.info("ui_target_detected", target=target_norm)
+                    if mapping:
+                        target_mapping = mapping
+                else:
+                    target_msg = f"Zielspalte '{target_norm}' enthält keine nutzbaren Werte."
+                    df_features = df_norm_all.drop(columns=[target_norm])
+                    logger.warning("ui_target_empty", target=target_norm)
     elif target_norm:
         target_msg = f"Warnung: Zielspalte '{target_norm}' nicht gefunden."
         logger.warning("ui_target_missing", target=target_norm)
@@ -1710,23 +1733,23 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         logger.warning("ui_baseline_without_target")
         return "Keine Zielspalte verfuegbar.", None, None, None, None, state
 
+    target_series = pd.Series(target).reset_index(drop=True)
+    target_series = target_series.fillna("Unbekannt").astype(str)
+
     config = _ensure_config(state)
     rf_kwargs = config.model.random_forest.model_dump(exclude_none=True)
 
     baseline = Pipeline(
         steps=[
             ("preprocessor", build_preprocessor(feature_plan, config)),
-            (
-                "classifier",
-                RandomForestClassifier(**rf_kwargs),
-            ),
+            ("classifier", RandomForestClassifier(**rf_kwargs)),
         ]
     )
 
-    test_size_count, stratify = _compute_split_params(target)
+    test_size_count, stratify = _compute_split_params(target_series)
     X_train, X_test, y_train, y_test = train_test_split(
         df_features,
-        target,
+        target_series,
         test_size=test_size_count,
         random_state=config.model.random_forest.random_state,
         stratify=stratify,
@@ -1744,21 +1767,27 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             samples=len(y_train),
         )
 
+    label_encoder = LabelEncoder()
+    label_encoder.fit(target_series)
+    classes = list(label_encoder.classes_)
+
     baseline.fit(X_train, y_train)
     y_pred = baseline.predict(X_test)
 
+    y_test_encoded = label_encoder.transform(y_test)
+    y_pred_encoded = label_encoder.transform(y_pred)
+    metrics_summary = evaluate_multiclass(y_test_encoded, y_pred_encoded, classes)
+
     metrics = {
-        "recall": float(recall_score(y_test, y_pred, average="macro", zero_division=0)),
-        "precision": float(precision_score(y_test, y_pred, average="macro", zero_division=0)),
-        "f2_score": float(fbeta_score(y_test, y_pred, average="macro", beta=2.0, zero_division=0)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
-        "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
-        "classification_report": classification_report(y_test, y_pred, zero_division=0),
+        "accuracy": float(metrics_summary["accuracy"]),
+        "macro_f1": float(metrics_summary["macro_f1"]),
+        "weighted_f1": float(metrics_summary["weighted_f1"]),
+        "classes": classes,
+        "classification_report": metrics_summary["classification_report"],
     }
-    confusion = confusion_matrix(y_test, y_pred)
-    confusion_df = pd.DataFrame(confusion)
-    confusion_df.columns = [f"Pred {c}" for c in confusion_df.columns]
-    confusion_df.index = [f"Actual {i}" for i in confusion_df.index]
+
+    confusion = np.asarray(metrics_summary["confusion_matrix"], dtype=float)
+    confusion_df = pd.DataFrame(confusion, index=classes, columns=classes)
 
     encoder = baseline.named_steps["preprocessor"].named_steps.get("encode")
     if encoder is not None and hasattr(encoder, "get_feature_names_out"):
@@ -1772,63 +1801,71 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     top20 = importance_df.head(20).reset_index(drop=True)
 
     proba = baseline.predict_proba(X_test)
-    if proba.ndim == 1:
-        pos_scores = proba
-    elif proba.shape[1] == 1:
-        pos_scores = proba[:, 0]
+    ml_confidence = proba.max(axis=1)
+    ml_prediction = pd.Series(y_pred, name="ml_prediction").reset_index(drop=True)
+    ml_confidence_series = pd.Series(ml_confidence, name="ml_confidence").reset_index(drop=True)
+
+    historical_df = X_train.copy()
+    historical_df[config.data.target_col or "Massnahme_2025"] = y_train.reset_index(drop=True)
+
+    rule_engine = None
+    hybrid_results = None
+    business_rules: List[BusinessRule] = []
+    try:
+        business_rules = load_business_rules_from_file(MASSNAHMEN_RULES_PATH)
+    except FileNotFoundError:
+        logger.warning("ui_rules_missing", path=str(MASSNAHMEN_RULES_PATH))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("ui_rules_load_failed", message=str(exc))
+
+    if business_rules:
+        rule_engine = RuleEngine(business_rules, historical_data=historical_df)
+        hybrid_predictor = HybridMassnahmenPredictor(baseline, rule_engine)
+        hybrid_results = hybrid_predictor.predict(X_test.reset_index(drop=True))
     else:
-        classes = list(baseline.named_steps["classifier"].classes_)
-        positive_index = 1 if len(classes) > 1 else 0
-        for candidate in ("1", 1, "fraud", "Fraud", True):
-            if candidate in classes:
-                positive_index = classes.index(candidate)
-                break
-        if len(classes) == 2:
-            pos_scores = proba[:, positive_index]
-        else:
-            pos_scores = proba.max(axis=1)
-
-    fraud_scores = pd.Series(pos_scores * 100.0, name="fraud_score")
-    predictions_raw = pd.Series(baseline.predict(X_test), name="prediction_raw")
-
-    positive_label = None
-    classifier = baseline.named_steps.get("classifier")
-    classes = list(getattr(classifier, "classes_", []))
-    n_classes = len(classes)
-
-    if n_classes == 2:
-        positive_index = 1
-        for candidate in ("1", 1, "fraud", "Fraud", True):
-            if candidate in classes:
-                positive_index = classes.index(candidate)
-                break
-        positive_label = classes[positive_index]
-
-    if positive_label is not None:
-        predictions_binary = (predictions_raw == positive_label).astype(int)
-    else:
-        predictions_binary = pd.Series(
-            np.where(fraud_scores >= 50.0, 1, 0),
-            index=predictions_raw.index,
-            name="prediction",
+        hybrid_results = pd.DataFrame(
+            {
+                "prediction": ml_prediction,
+                "confidence": ml_confidence_series,
+                "source": ["ml"] * len(ml_prediction),
+            }
         )
 
-    predictions_col = predictions_binary.rename("prediction")
+    final_prediction = ml_prediction.copy()
+    final_confidence = ml_confidence_series.copy()
+    rule_prediction = []
+    rule_confidence = []
+    applied_rule = []
 
-    actual_series = pd.Series(y_test).reset_index(drop=True)
-    predictions_col = predictions_col.reset_index(drop=True)
-    fraud_scores = fraud_scores.reset_index(drop=True)
+    for idx, row in hybrid_results.iterrows():
+        source = row.get("source", "ml") or "ml"
+        applied_rule.append(source if source != "ml" else None)
+        rule_prediction.append(row.get("prediction") if source != "ml" else None)
+        conf = row.get("confidence")
+        rule_confidence.append(conf if source != "ml" else None)
+        if source != "ml":
+            final_prediction.iloc[idx] = row.get("prediction", final_prediction.iloc[idx])
+            if conf is not None:
+                try:
+                    final_confidence.iloc[idx] = float(conf)
+                except (TypeError, ValueError):
+                    pass
 
     predictions_df = pd.DataFrame(
         {
-            "row_index": np.arange(len(fraud_scores)),
-            "fraud_score": fraud_scores,
-            "prediction": predictions_col,
-            "prediction_raw": predictions_raw.reset_index(drop=True),
-            "actual": actual_series,
+            "row_index": np.arange(len(final_prediction)),
+            "ml_prediction": ml_prediction,
+            "ml_confidence": ml_confidence_series,
+            "rule_source": applied_rule,
+            "rule_prediction": rule_prediction,
+            "rule_confidence": rule_confidence,
+            "final_prediction": final_prediction,
+            "final_confidence": final_confidence,
+            "actual": y_test.reset_index(drop=True),
         }
     )
-    predictions_df.sort_values("fraud_score", ascending=False, inplace=True)
+    predictions_df["confidence_percent"] = predictions_df["final_confidence"].astype(float, errors="ignore") * 100.0
+    predictions_df.sort_values("final_confidence", ascending=False, inplace=True)
     predictions_display = predictions_df.head(50).reset_index(drop=True)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_model_"))
@@ -1839,7 +1876,6 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     predictions_path = tmp_dir / "predictions.csv"
 
     joblib.dump(baseline, model_path)
-    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     importance_df.to_csv(importance_path, index=False)
     predictions_df.to_csv(predictions_path, index=False)
 
@@ -1854,6 +1890,12 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         plt.close()
         plot_image = str(plot_path)
 
+    metrics_serializable = {
+        **metrics,
+        "confusion_matrix": confusion.tolist(),
+    }
+    metrics_path.write_text(json.dumps(metrics_serializable, indent=2), encoding="utf-8")
+
     state.update(
         {
             "baseline_model": baseline,
@@ -1865,6 +1907,12 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "shap_feature_names": list(feature_names),
             "feature_importances": importance_df.to_dict(orient="records"),
             "predictions_full": predictions_df,
+            "label_encoder": label_encoder,
+            "label_classes": classes,
+            "rule_engine": rule_engine,
+            "business_rules": business_rules,
+            "historical_training_data": historical_df,
+            "hybrid_results": hybrid_results,
         }
     )
 
@@ -1887,17 +1935,12 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         "metrics_path": str(metrics_path),
         "importance_path": str(importance_path),
         "predictions_path": str(predictions_path),
-        "recall": metrics["recall"],
-        "precision": metrics["precision"],
-        "f2_score": metrics["f2_score"],
-        "balanced_accuracy": metrics["balanced_accuracy"],
+        "accuracy": metrics["accuracy"],
         "macro_f1": metrics["macro_f1"],
+        "weighted_f1": metrics["weighted_f1"],
     }
 
-    logger.info(
-        "ui_baseline_trained",
-        **mask_sensitive_data(metric_summary),
-    )
+    logger.info("ui_baseline_trained", **mask_sensitive_data(metric_summary))
 
     return (
         "Baseline trainiert.",
@@ -1956,22 +1999,25 @@ def explain_prediction_action(state: Optional[Dict[str, Any]], row_index):
         background = bg.toarray() if hasattr(bg, "toarray") else bg
         state["shap_background"] = background
 
+    class_names = list(getattr(classifier, "classes_", []))
     try:
         explainer = shap.TreeExplainer(classifier, background)
         shap_values = explainer.shap_values(transformed_dense)
         if isinstance(shap_values, list):
-            classes = list(getattr(classifier, "classes_", [0, 1]))
-            pos_idx = 1 if len(classes) > 1 else 0
-            for candidate in ("1", 1, True, "fraud", "Fraud"):
-                if candidate in classes:
-                    pos_idx = classes.index(candidate)
-                    break
-            shap_row = shap_values[pos_idx][0]
+            try:
+                proba = baseline.predict_proba(sample)
+                class_index = int(np.argmax(proba[0])) if proba.ndim == 2 else 0
+            except Exception:  # pragma: no cover - defensive
+                class_index = 0
+            class_index = max(0, min(class_index, len(shap_values) - 1))
+            shap_row = shap_values[class_index][0]
         else:
             shap_row = shap_values[0]
     except Exception as exc:
         logger.error("ui_shap_failed", message=str(exc))
         return f"SHAP konnte nicht berechnet werden: {exc}", None, None, state
+
+    state["shap_classes"] = class_names
 
     shap_row = np.asarray(shap_row)
     if shap_row.ndim > 1:
@@ -2040,6 +2086,10 @@ def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
     if df_features is None or target is None or feature_importance is None:
         return "Bitte zuerst Baseline trainieren.", None, state
 
+    target_series = pd.Series(target)
+    if target_series.nunique(dropna=True) > 2:
+        return "Pattern-Report derzeit nur für binäre Ziele verfügbar.", None, state
+
     report_lines = ["# Fraud Pattern Report", ""]
     top_features = feature_importance.head(10)
     report_lines.append("## Top Risiko-Features")
@@ -2048,7 +2098,9 @@ def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
     report_lines.append("")
 
     df_local = df_features.copy()
-    y = target.astype(int)
+    y = target_series.astype(int, errors="ignore")
+    if not np.issubdtype(y.dtype, np.number):
+        y = pd.Series(np.where(target_series == target_series.mode().iloc[0], 1, 0))
     df_local["is_fraud"] = y
 
     report_lines.append("## Fraud-Rate nach Land")
@@ -2151,12 +2203,53 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
         df_input[col] = np.nan
     df_input = df_input[selected_columns]
 
-    progress(0.3, desc="Berechne Scores")
-    scores = model.predict_proba(df_input)[:, -1]
-    predictions = (scores >= 0.5).astype(int)
+    rule_engine = state.get("rule_engine")
+    progress(0.3, desc="Berechne Vorhersagen")
+    proba = model.predict_proba(df_input)
+    ml_prediction = model.predict(df_input)
+    ml_confidence = proba.max(axis=1)
+
+    if rule_engine is not None:
+        hybrid_predictor = HybridMassnahmenPredictor(model, rule_engine)
+        hybrid_results = hybrid_predictor.predict(df_input.reset_index(drop=True))
+    else:
+        hybrid_results = pd.DataFrame(
+            {
+                "prediction": ml_prediction,
+                "confidence": ml_confidence,
+                "source": ["ml"] * len(ml_prediction),
+            }
+        )
+
+    final_prediction = []
+    final_confidence = []
+    rule_prediction = []
+    rule_source = []
+    rule_confidence = []
+    for idx, row in hybrid_results.iterrows():
+        source = row.get("source", "ml") or "ml"
+        rule_source.append(source if source != "ml" else None)
+        rule_prediction.append(row.get("prediction") if source != "ml" else None)
+        rule_confidence.append(row.get("confidence") if source != "ml" else None)
+        if source != "ml":
+            final_prediction.append(row.get("prediction", ml_prediction[idx]))
+            final_confidence.append(row.get("confidence", ml_confidence[idx]))
+        else:
+            final_prediction.append(ml_prediction[idx])
+            final_confidence.append(ml_confidence[idx])
+
+    final_confidence = [float(c) if c is not None else 0.0 for c in final_confidence]
+    rule_confidence = [float(c) if c is not None else None for c in rule_confidence]
+
     df_out = df_input.copy()
-    df_out["fraud_score"] = scores * 100.0
-    df_out["prediction"] = predictions
+    df_out["ml_prediction"] = ml_prediction
+    df_out["ml_confidence"] = ml_confidence
+    df_out["rule_source"] = rule_source
+    df_out["rule_prediction"] = rule_prediction
+    df_out["rule_confidence"] = rule_confidence
+    df_out["final_prediction"] = final_prediction
+    df_out["final_confidence"] = final_confidence
+
     progress(0.8, desc="Schreibe Ergebnis")
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_batch_"))
     out_path = tmp_dir / "batch_predictions.xlsx"
@@ -2169,13 +2262,18 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
         output=str(out_path),
     )
 
-    return "Batch abgeschlossen.", str(out_path)
+    message = "Batch abgeschlossen."
+    if "negativ" in df_input.columns:
+        message += " Hinweis: 'negativ'-Flag erkannt; in Produktivdaten sollte dieses Feld nicht enthalten sein."
+
+    return message, str(out_path)
 
 
 def record_feedback(state: Dict[str, Any], row_index: int, feedback: str, user: str, comment: str) -> str:
     ensure_feedback_db()
     predictions = state.get("predictions_full")
     df_features = state.get("df_features")
+    label_encoder = state.get("label_encoder")
     if predictions is None or df_features is None:
         return "Keine Predictions verfügbar."
 
@@ -2185,6 +2283,17 @@ def record_feedback(state: Dict[str, Any], row_index: int, feedback: str, user: 
     row = predictions.iloc[row_index]
     df_row = df_features.iloc[row_index]
     beleg_id = df_row.get("Rechnungsnummer") if isinstance(df_row, pd.Series) else None
+
+    final_prediction = row.get("final_prediction")
+    final_confidence = float(row.get("final_confidence", 0.0)) if row.get("final_confidence") is not None else 0.0
+    prediction_code: int
+    if label_encoder is not None and final_prediction is not None:
+        try:
+            prediction_code = int(label_encoder.transform([str(final_prediction)])[0])
+        except Exception:  # pragma: no cover - defensive
+            prediction_code = 0
+    else:
+        prediction_code = 0
 
     with sqlite3.connect(FEEDBACK_DB_PATH) as conn:
         conn.execute(
@@ -2197,8 +2306,8 @@ def record_feedback(state: Dict[str, Any], row_index: int, feedback: str, user: 
                 None if pd.isna(beleg_id) else str(beleg_id),
                 datetime.utcnow().isoformat(),
                 user or "unknown",
-                float(row["fraud_score"]),
-                int(row["prediction"]),
+                float(final_confidence * 100.0),
+                prediction_code,
                 feedback,
                 comment or "",
             ),
