@@ -76,13 +76,19 @@ def engineer_features(df: pd.DataFrame, schema: Schema) -> Tuple[pd.DataFrame, p
 def evaluate_multiclass(y_true, y_pred, classes):
     """Return multi-class metrics dictionary for Maßnahme predictions."""
 
+    labels = np.arange(len(classes))
     return {
         "accuracy": accuracy_score(y_true, y_pred),
         "macro_f1": f1_score(y_true, y_pred, average="macro"),
         "weighted_f1": f1_score(y_true, y_pred, average="weighted"),
         "confusion_matrix": confusion_matrix(y_true, y_pred),
         "classification_report": classification_report(
-            y_true, y_pred, target_names=classes, output_dict=True
+            y_true,
+            y_pred,
+            labels=labels,
+            target_names=classes,
+            output_dict=True,
+            zero_division=0,
         ),
     }
 

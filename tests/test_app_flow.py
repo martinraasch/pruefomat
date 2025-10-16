@@ -128,8 +128,9 @@ def baseline_state():
         "Ampel": [1, 2, 1, 3, 1, 2, 3, 1, 2, 3],
     }
     df = pd.DataFrame(data)
-    features = df.drop(columns=["Ampel"])
-    target = df["Ampel"]
+    df = df.rename(columns={"Maßnahme 2025": "Massnahme_2025"})
+    features = df.drop(columns=["Ampel", "Massnahme_2025"])
+    target = df["Massnahme_2025"]
     config = DEFAULT_CONFIG.model_copy(deep=True)
     config.preprocessing.tfidf_min_df = 1
 
@@ -164,23 +165,31 @@ def test_recall_metrics(baseline_state):
 
 def test_confidence_scores(baseline_state):
     _, predictions, _ = baseline_state
-    assert (predictions["fraud_score"] >= 0).all()
-    assert (predictions["fraud_score"] <= 100).all()
+    assert "final_confidence" in predictions
+    assert predictions["final_confidence"].between(0, 1).all()
 
 
 def test_threshold_application(baseline_state):
     _, predictions, _ = baseline_state
-    expected = (predictions["fraud_score"] / 100 >= 0.5).astype(int)
-    assert predictions["prediction"].astype(int).tolist() == expected.tolist()
+    assert "final_prediction" in predictions
+    assert predictions["final_prediction"].notna().all()
 
 
 def test_shap_explanations(baseline_state):
     _, _, state = baseline_state
     status, explanation, download_path, _ = explain_massnahme_action(state, 0)
-    assert "Top-Features" in status
-    assert isinstance(explanation, list)
-    assert len(explanation) == 5
+
+    assert "Erklärung generiert" in status
+    assert isinstance(explanation, str)
     assert Path(download_path).exists()
+
+    if "ML-Prediction:" in explanation:
+        assert "Confidence:" in explanation
+        assert "Top SHAP-Features:" in explanation
+    else:
+        assert "Rule-Based:" in explanation or "Regel:" in explanation
+        assert "Regel:" in explanation
+        assert "Erfüllte Bedingungen:" in explanation
 
 
 def test_batch_prediction(tmp_path, baseline_state):
@@ -192,8 +201,8 @@ def test_batch_prediction(tmp_path, baseline_state):
     status, download_path = batch_predict_action(upload, state)
     assert "Batch abgeschlossen" in status
     out_df = pd.read_excel(download_path)
-    assert "fraud_score" in out_df.columns
-    assert "prediction" in out_df.columns
+    assert "final_prediction" in out_df.columns
+    assert "final_confidence" in out_df.columns
 
 
 def test_feedback_flow(baseline_state, feedback_db):

@@ -1829,9 +1829,17 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         "classes": classes,
         "classification_report": metrics_summary["classification_report"],
     }
+    metrics["recall"] = float(recall_score(y_test_encoded, y_pred_encoded, average="macro", zero_division=0))
+    metrics["precision"] = float(precision_score(y_test_encoded, y_pred_encoded, average="macro", zero_division=0))
+    metrics["f2_score"] = float(fbeta_score(y_test_encoded, y_pred_encoded, beta=2.0, average="macro", zero_division=0))
 
     confusion = np.asarray(metrics_summary["confusion_matrix"], dtype=float)
-    confusion_df = pd.DataFrame(confusion, index=classes, columns=classes)
+    label_lookup = {idx: cls for idx, cls in enumerate(classes)}
+    confusion_df = pd.DataFrame(
+        confusion,
+        index=[label_lookup.get(idx, str(idx)) for idx in range(confusion.shape[0])],
+        columns=[label_lookup.get(idx, str(idx)) for idx in range(confusion.shape[1])],
+    )
 
     encoder = baseline.named_steps["preprocessor"].named_steps.get("encode")
     if encoder is not None and hasattr(encoder, "get_feature_names_out"):
@@ -1843,10 +1851,6 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     importance_df = pd.DataFrame({"feature": feature_names, "importance": importance})
     importance_df.sort_values("importance", ascending=False, inplace=True)
     top20 = importance_df.head(20).reset_index(drop=True)
-
-    hybrid_predictor.preprocessor_ = baseline.named_steps["preprocessor"]
-    hybrid_predictor.feature_names_ = list(feature_names)
-    hybrid_predictor.label_encoder_ = label_encoder
 
     proba = baseline.predict_proba(X_test)
     ml_confidence = proba.max(axis=1)
@@ -1866,6 +1870,16 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
 
     rule_engine = RuleEngine(business_rules, historical_data=historical_df)
     hybrid_predictor = HybridMassnahmenPredictor(baseline, rule_engine)
+    hybrid_predictor.preprocessor_ = baseline.named_steps["preprocessor"]
+    hybrid_predictor.feature_names_ = list(feature_names)
+    hybrid_predictor.label_encoder_ = label_encoder
+    try:
+        shap_background = state.get("shap_background")
+    except KeyError:
+        shap_background = None
+    if shap_background is not None:
+        hybrid_predictor.background_ = shap_background
+
     hybrid_results = hybrid_predictor.predict(X_test.reset_index(drop=True))
 
     final_prediction = ml_prediction.copy()
