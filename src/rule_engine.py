@@ -19,6 +19,7 @@ class RuleEngine:
     ) -> None:
         self.rules: List[BusinessRule] = sorted(list(rules), key=lambda rule: rule.priority)
         self.historical_lookup = self._build_historical_lookup(historical_data)
+        self.current_allowed_classes: Optional[List[str]] = None
 
     @staticmethod
     def _build_historical_lookup(
@@ -49,9 +50,11 @@ class RuleEngine:
     def evaluate(self, row: pd.Series) -> Tuple[Optional[str], Optional[float], str]:
         """Evaluate ordered rules for a single row."""
 
+        self.current_allowed_classes = None
         for rule in self.rules:
             if self._check_condition(rule, row):
                 if rule.action_value == "ML_PREDICTION":
+                    self.current_allowed_classes = rule.ml_allowed_classes
                     return None, None, rule.name
                 return rule.action_value, rule.confidence, rule.name
 
@@ -94,8 +97,12 @@ class RuleEngine:
             return bool(field_value != target_value)
         if operator == RuleOperator.LESS_THAN:
             return self._compare_numeric(field_value, target_value, lambda a, b: a < b)
+        if operator == RuleOperator.LESS_THAN_OR_EQUAL:
+            return self._compare_numeric(field_value, target_value, lambda a, b: a <= b)
         if operator == RuleOperator.GREATER_THAN:
             return self._compare_numeric(field_value, target_value, lambda a, b: a > b)
+        if operator == RuleOperator.GREATER_THAN_OR_EQUAL:
+            return self._compare_numeric(field_value, target_value, lambda a, b: a >= b)
         if operator == RuleOperator.IN:
             return self._in_collection(field_value, target_value, True)
         if operator == RuleOperator.NOT_IN:

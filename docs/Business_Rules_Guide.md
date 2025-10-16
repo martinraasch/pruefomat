@@ -1,54 +1,76 @@
 # Business Rules für Maßnahmen-Ableitung
 
-Das System kombiniert deterministische Business-Regeln mit einem Machine-Learning-Modell. Die Regeln werden der Reihe nach (niedrigste `priority` zuerst) ausgewertet. Greift eine Regel, liefert sie die finale Maßnahme; andernfalls fällt das System auf die ML-Vorhersage zurück.
+Das System kombiniert deterministische Regeln mit Machine-Learning. Die Regeln werden gemäß ihrer `priority` ausgewertet; bei einem Treffer liefert die Regel das Ergebnis. Andernfalls greift ein ML-Fallback mit ggf. eingeschränkten Maßnahmenklassen.
 
-## Regel-Hierarchie
+## Alle 17 Maßnahmenklassen
 
-### Priority 1 – Niedrig-Betrag & Grüne Ampel
-- **Bedingung:** `Ampel = 1 (Grün)` **und** `Betrag < 50.000 €`
-- **Maßnahme:** `Rechnungsprüfung`
-- **Confidence:** `1.0` (100 %)
-- **Beispiel:** Rechnung über 30.000 € mit Ampel Grün ⇒ automatische Rechnungsprüfung.
+### Kategorie 1: Automatische Freigabe (Grüne Ampel)
+1. **Rechnungsprüfung** – Ampel = Grün (1) und Betrag < 50.000 €
+2. **Freigabe gemäß Kompetenzkatalog** – Ampel = Grün (1) und Betrag ≥ 50.000 €
 
-### Priority 2 – Historisches Gutschrift-Muster
-- **Bedingung:** Für die Kombination `BUK + Debitor` wurden mindestens zwei Mal die Maßnahme `Gutschrift` vergeben.
-- **Maßnahme:** `Gutschrift`
-- **Confidence:** `0.9` (90 %)
-- **Beispiel:** Debitor 100 im Buchungskreis A erhielt bereits drei Mal `Gutschrift` ⇒ erneut `Gutschrift`.
+### Kategorie 2: Nachweisanforderungen (Gelbe Ampel)
+3. **Beibringung Liefer-/Leistungsnachweis (vorgelagert)**
+4. **Beibringung Liefer-/Leistungsnachweis (nachgelagert)**
+5. **Beibringung Auftrag/Bestellung/Vertrag (vorgelagert)**
+6. **Beibringung Auftrag/Bestellung/Vertrag (nachgelagert)**
+7. **telefonische Rechnungsbestätigung (vorgelagert)**
+8. **telefonische Rechnungsbestätigung (nachgelagert)**
 
-### Priority 3 – Negativ-Kennzeichnung
-- **Bedingung:** Spalte `negativ = True`
-- **Maßnahme:** `Ablehnung`
-- **Confidence:** `1.0`
-- **Beispiel:** Rechnung wurde vom Factoring abgelehnt (`negativ = 1`) ⇒ Maßnahme `Ablehnung`.
+### Kategorie 3: Intensive Prüfung (Rote Ampel)
+9. **telefonische Lieferbestätigung (vorgelagert)**
+10. **telefonische Lieferbestätigung (nachgelagert)**
+11. **schriftliche Saldenbestätigung (vorgelagert)**
+12. **schriftliche Saldenbestätigung (nachgelagert)**
+13. **telefonische Saldenbestätigung (nachgelagert)**
+14. **schriftliche Rechnungsbestätigung beim DEB (vorgelagert)**
+15. **schriftliche Rechnungsbestätigung beim DEB (nachgelagert)**
+16. **nur zur Belegerfassung**
 
-### Priority 999 – ML-Fallback
-- **Bedingung:** Keine der vorherigen Regeln trifft zu.
-- **Maßnahme:** Ergebnis des ML-Modells (`ML_PREDICTION`)
-- **Confidence:** entspricht der Modellwahrscheinlichkeit.
+### Kategorie 4: Sonderfälle
+17. **Gutschriftsverfahren** – historisches Muster (≥ 2 × „Gutschriftsverfahren“ für BUK + Debitor)
+
+## Entscheidungslogik
+
+```mermaid
+graph TD
+    A[Neue Rechnung] --> B{negativ=True?}
+    B -->|Ja| Z[Bereits abgelehnt (negativ)]
+    B -->|Nein| C{Ampel?}
+
+    C -->|Grün (1)| D{Betrag?}
+    D -->|< 50k| E[Rechnungsprüfung]
+    D -->|≥ 50k| F[Freigabe gemäß Kompetenzkatalog]
+
+    C -->|Gelb (2)| G[ML: Nachweis-Kategorie 3–8]
+    C -->|Rot (3)| H[ML: Intensive Prüfung 9–16]
+
+    H --> I{BUK+Debitor ≥ 2× Gutschriftsverfahren?}
+    G --> I
+    I -->|Ja| J[Gutschriftsverfahren]
+    I -->|Nein| K[ML-Fallback]
+```
+
+## Wichtige Hinweise
+
+### Negativ-Spalte
+- **Training:** wird als Feature genutzt.
+- **Prediction:** Datensätze mit `negativ=True` werden gefiltert und mit „Bereits abgelehnt (negativ)“ zurückgegeben (Score = 100 %, Quelle = `negativ_flag`).
+
+### Betragsgrenzen
+- Bei **grüner Ampel** entscheidet der Betrag: `< 50.000 €` → Rechnungsprüfung, `≥ 50.000 €` → Freigabe gemäß Kompetenzkatalog.
+- Die Grenze spielt bei gelber/roter Ampel keine Rolle (ML übernimmt mit erlaubten Klassen).
+
+### ML-Klassen-Einschränkung
+- **Gelbe Ampel (2):** ML wählt ausschließlich aus den Nachweis-Maßnahmen (Klassen 3–8).
+- **Rote Ampel (3):** ML wählt ausschließlich aus den intensiven Prüfmaßnahmen (Klassen 9–16).
+- **Grüne Ampel (1):** komplette Entscheidungslogik über Regeln, kein ML-Einsatz.
+
+### Historische Gutschriften
+- Das System prüft BUK + Debitor-Kombinationen. Ab zwei Gutschriften greift automatisch `Gutschriftsverfahren`.
+- Neue Kombinationen werden wie gewohnt über die Ampelfarbe behandelt; ML setzt die passende Maßnahme innerhalb der erlaubten Klassen.
 
 ## Regeln anpassen
 
-Die Konfiguration der Business-Regeln befindet sich in `config/business_rules_massnahmen.yaml`. Jede Regel hat folgende Struktur:
-
-```yaml
-- name: "regel_name"
-  priority: 1
-  condition:
-    type: "and" | "or" | "simple" | "feature_lookup" | "always"
-    rules:
-      - field: "Ampel"
-        operator: "equals"
-        value: 1
-  action:
-    set_field: "Massnahme_2025"
-    value: "Rechnungsprüfung"
-  confidence: 1.0
-```
-
-**Schritte zur Anpassung:**
-1. Datei `config/business_rules_massnahmen.yaml` öffnen.
-2. Regel-Blöcke ergänzen oder ändern (z. B. weitere Bedingungen, andere Aktionen).
-3. Datei speichern und Anwendung neu starten bzw. Pipeline erneut trainieren.
-
-> Tipp: Prioritäten bestimmen die Reihenfolge. Niedrigere Zahlen werden zuerst geprüft. Für Tests empfehlen wir, neue Regeln zuerst in einer Staging-Umgebung zu validieren.
+- Konfigurationsdatei: `config/business_rules_massnahmen.yaml`
+- Jede Regel besteht aus Name, Priority, Bedingung (`condition`), Aktion (`action`) und optionalen Feldern (`confidence`, `description`, `ml_allowed_classes`).
+- Nach Änderungen Anwendung/Pipeline neu starten.

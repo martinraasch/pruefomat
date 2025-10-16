@@ -1,12 +1,15 @@
+from pathlib import Path
 from types import SimpleNamespace
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+import pytest
 
 from app import (
     _initial_state,
-    load_dataset,
+    batch_predict_action,
     build_pipeline_action,
+    load_dataset,
     train_baseline_action,
 )
 from src.business_rules import BusinessRule, RuleOperator, SimpleCondition
@@ -109,3 +112,57 @@ def test_rule_vs_ml_conflict_resolution():
     result_fallback = predictor_fallback.predict(df)
     assert result_fallback.loc[0, "source"] == "ml"
     assert result_fallback.loc[0, "prediction"] == "MLAction"
+
+
+def test_negativ_filter_in_batch(tmp_path, monkeypatch):
+    class DummyProgress:
+        def __call__(self, *args, **kwargs):
+            return None
+
+    class DummyModel:
+        def predict_proba(self, X):  # noqa: N802
+            return np.tile(np.array([0.2, 0.8]), (len(X), 1))
+
+        def predict(self, X):  # noqa: N802
+            return np.array(["Rechnungsprüfung"] * len(X))
+
+    monkeypatch.setattr("app.gr.Progress", lambda track_tqdm=False: DummyProgress())
+
+    df = pd.DataFrame(
+        {
+            "Betrag": ["1000,00", "2000,00", "3000,00"],
+            "Ampel": [1, 2, 1],
+            "negativ": [False, True, False],
+            "BUK": ["A", "B", "C"],
+            "Debitor": ["100", "200", "300"],
+        }
+    )
+    path = tmp_path / "batch.xlsx"
+    df.to_excel(path, index=False)
+
+    state = _initial_state()
+    state.update(
+        {
+            "baseline_model": DummyModel(),
+            "selected_columns": ["Betrag", "Ampel", "BUK", "Debitor"],
+            "hybrid_predictor": None,
+            "rule_engine": None,
+        }
+    )
+
+    upload = SimpleNamespace(name=str(path))
+    status, output_path = batch_predict_action(upload, state)
+
+    assert "Batch abgeschlossen" in status
+    out_df = pd.read_excel(output_path)
+
+    negativ_rows = out_df[out_df["Debitor"] == "200"]
+    assert len(negativ_rows) == 1
+    negativ_row = negativ_rows.iloc[0]
+    assert "Bereits abgelehnt" in negativ_row["Massnahme_2025"]
+    assert pytest.approx(negativ_row["fraud_score"], rel=1e-6) == 100.0
+    assert negativ_row["prediction_source"] == "negativ_flag"
+
+    normal_rows = out_df[out_df["Debitor"].isin(["100", "300"])]
+    assert len(normal_rows) == 2
+    assert all(normal_rows["prediction_source"] != "negativ_flag")

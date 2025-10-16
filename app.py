@@ -2201,20 +2201,40 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     progress(0.05, desc="Lade Datei")
     df_input_raw = pd.read_excel(upload.name)
     df_input, _ = normalize_columns(df_input_raw)
+
+    df_negativ = None
+    if "negativ" in df_input.columns:
+        negativ_mask = df_input["negativ"].fillna(False).astype(bool)
+        n_negativ = int(negativ_mask.sum())
+        if n_negativ > 0:
+            logger.info(
+                "batch_prediction_filtered_negativ",
+                n_filtered=n_negativ,
+                n_total=len(df_input),
+            )
+            df_negativ = df_input.loc[negativ_mask].copy()
+            df_negativ["Massnahme_2025"] = "Bereits abgelehnt (negativ)"
+            df_negativ["final_confidence"] = 1.0
+            df_negativ["prediction_source"] = "negativ_flag"
+            df_input = df_input.loc[~negativ_mask].copy()
+        else:
+            df_negativ = None
+        df_input = df_input.drop(columns=["negativ"])
+    else:
+        df_negativ = None
+
     config = _ensure_config(state)
     target_col = config.data.target_col
     if target_col and target_col in df_input.columns:
         df_input = df_input.drop(columns=[target_col])
+
     selected_columns = state.get("selected_columns") or list(df_input.columns)
     missing = [col for col in selected_columns if col not in df_input.columns]
     for col in missing:
         df_input[col] = np.nan
     df_input = df_input[selected_columns]
 
-    progress(0.3, desc="Berechne Vorhersagen")
-    proba = model.predict_proba(df_input)
-    ml_prediction = model.predict(df_input)
-    ml_confidence = proba.max(axis=1)
+    progress(0.3, desc="Berechne Maßnahmen")
 
     hybrid_predictor = state.get("hybrid_predictor")
     rule_engine = state.get("rule_engine")
@@ -2228,44 +2248,30 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
         state["hybrid_predictor"] = hybrid_predictor
 
     if hybrid_predictor is not None:
-        hybrid_results = hybrid_predictor.predict(df_input.reset_index(drop=True))
+        results = hybrid_predictor.predict(df_input.reset_index(drop=True))
+        df_input["Massnahme_2025"] = results["prediction"]
+        df_input["final_confidence"] = results["confidence"].astype(float, errors="ignore")
+        df_input["prediction_source"] = results["source"]
     else:
-        hybrid_results = pd.DataFrame(
-            {
-                "prediction": ml_prediction,
-                "confidence": ml_confidence,
-                "source": ["ml"] * len(ml_prediction),
-            }
-        )
+        proba = model.predict_proba(df_input)
+        ml_prediction = model.predict(df_input)
+        ml_confidence = proba.max(axis=1)
+        df_input["Massnahme_2025"] = ml_prediction
+        df_input["final_confidence"] = ml_confidence
+        df_input["prediction_source"] = "ml"
 
-    final_prediction = []
-    final_confidence = []
-    rule_prediction = []
-    rule_source = []
-    rule_confidence = []
-    for idx, row in hybrid_results.iterrows():
-        source = row.get("source", "ml") or "ml"
-        rule_source.append(source if source != "ml" else None)
-        rule_prediction.append(row.get("prediction") if source != "ml" else None)
-        rule_confidence.append(row.get("confidence") if source != "ml" else None)
-        if source != "ml":
-            final_prediction.append(row.get("prediction", ml_prediction[idx]))
-            final_confidence.append(row.get("confidence", ml_confidence[idx]))
-        else:
-            final_prediction.append(ml_prediction[idx])
-            final_confidence.append(ml_confidence[idx])
+    df_input["final_confidence"] = pd.to_numeric(df_input["final_confidence"], errors="coerce").fillna(0.0)
+    df_input["fraud_score"] = df_input["final_confidence"] * 100.0
 
-    final_confidence = [float(c) if c is not None else 0.0 for c in final_confidence]
-    rule_confidence = [float(c) if c is not None else None for c in rule_confidence]
-
-    df_out = df_input.copy()
-    df_out["ml_prediction"] = ml_prediction
-    df_out["ml_confidence"] = ml_confidence
-    df_out["rule_source"] = rule_source
-    df_out["rule_prediction"] = rule_prediction
-    df_out["rule_confidence"] = rule_confidence
-    df_out["final_prediction"] = final_prediction
-    df_out["final_confidence"] = final_confidence
+    if df_negativ is not None:
+        df_negativ["fraud_score"] = 100.0
+        for column in df_input.columns:
+            if column not in df_negativ.columns:
+                df_negativ[column] = np.nan
+        df_negativ = df_negativ[df_input.columns]
+        df_out = pd.concat([df_input, df_negativ], ignore_index=True)
+    else:
+        df_out = df_input
 
     progress(0.8, desc="Schreibe Ergebnis")
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_batch_"))
@@ -2275,15 +2281,16 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
 
     logger.info(
         "ui_batch_prediction_completed",
-        rows=len(df_input),
+        rows_predicted=len(df_input),
+        rows_negativ=len(df_negativ) if df_negativ is not None else 0,
         output=str(out_path),
     )
 
-    message = "Batch abgeschlossen."
-    if "negativ" in df_input.columns:
-        message += " Hinweis: 'negativ'-Flag erkannt; in Produktivdaten sollte dieses Feld nicht enthalten sein."
-
-    return message, str(out_path)
+    status = (
+        f"Batch abgeschlossen: {len(df_input)} Predictions,"
+        f" {len(df_negativ) if df_negativ is not None else 0} bereits abgelehnt"
+    )
+    return status, str(out_path)
 
 
 def record_feedback(state: Dict[str, Any], row_index: int, feedback: str, user: str, comment: str) -> str:

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Literal, Optional
+import logging
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,6 +29,7 @@ class HybridMassnahmenPredictor:
         self.feature_names_: Optional[Iterable[str]] = None
         self.label_encoder_ = None
         self._shap_explainer = None
+        self._logger = logging.getLogger(__name__)
 
     def predict(self, X: pd.DataFrame) -> pd.DataFrame:
         """Return DataFrame containing prediction, confidence, and source."""
@@ -39,10 +41,13 @@ class HybridMassnahmenPredictor:
 
         for _, row in X.iterrows():
             prediction, confidence, source = self.rule_engine.evaluate(row)
+            allowed_classes = getattr(self.rule_engine, "current_allowed_classes", None)
 
             if prediction is None:
-                prediction, confidence = self._run_ml(row)
-                source = "ml"
+                prediction, confidence, restricted = self._run_ml(row, allowed_classes=allowed_classes)
+                source = (
+                    f"ml_restricted_{row.get('Ampel', 'unknown')}" if restricted else "ml"
+                )
 
             records.append(
                 {
@@ -58,6 +63,7 @@ class HybridMassnahmenPredictor:
         """Provide per-row explanation for hybrid prediction."""
 
         prediction, confidence, source = self.rule_engine.evaluate(row)
+        allowed_classes = getattr(self.rule_engine, "current_allowed_classes", None)
 
         explanation: Dict[str, Any] = {
             "prediction": prediction,
@@ -67,24 +73,53 @@ class HybridMassnahmenPredictor:
         }
 
         if prediction is None:
-            prediction, confidence = self._run_ml(row)
+            prediction, confidence, restricted = self._run_ml(row, allowed_classes=allowed_classes)
             explanation["prediction"] = prediction
             explanation["confidence"] = confidence
-            explanation["source"] = "ml"
+            explanation["source"] = "ml_restricted" if restricted else "ml"
             explanation["details"]["shap_top5"] = self._get_shap_explanation(row)
         elif source:
             explanation["details"]["matched_conditions"] = self._get_rule_conditions(source, row)
 
         return explanation
 
-    def _run_ml(self, row: pd.Series) -> tuple[str, Optional[float]]:
+    def _run_ml(
+        self, row: pd.Series, allowed_classes: Optional[List[str]] = None
+    ) -> tuple[str, Optional[float], bool]:
         proba = self.ml_model.predict_proba(row.to_frame().T)[0]
         classes = getattr(self.ml_model, "classes_", None)
         if classes is None:
             classes = self.ml_model.predict(row.to_frame().T)
-            return str(classes[0]), None
+            return str(classes[0]), None, False
+        if allowed_classes:
+            allowed_set = {str(name) for name in allowed_classes}
+            class_to_index = {str(cls): idx for idx, cls in enumerate(classes)}
+            valid_indices = [class_to_index[name] for name in allowed_set if name in class_to_index]
+            if valid_indices:
+                restricted = proba[valid_indices]
+                if restricted.sum() == 0:
+                    restricted = np.full(len(valid_indices), 1.0 / len(valid_indices), dtype=float)
+                else:
+                    restricted = restricted / restricted.sum()
+                best_local = valid_indices[int(restricted.argmax())]
+                chosen_class = str(classes[best_local])
+                chosen_conf = float(restricted.max())
+                self._logger.info(
+                    "hybrid_ml_restricted",
+                    ampelfarbe=row.get("Ampel"),
+                    allowed=list(allowed_set),
+                    chosen=chosen_class,
+                    confidence=chosen_conf,
+                )
+                return chosen_class, chosen_conf, True
+            else:
+                self._logger.warning(
+                    "hybrid_ml_restriction_empty",
+                    ampelfarbe=row.get("Ampel"),
+                    allowed=list(allowed_set),
+                )
         best_idx = int(proba.argmax())
-        return str(classes[best_idx]), float(proba[best_idx])
+        return str(classes[best_idx]), float(proba[best_idx]), False
 
     def _get_shap_explanation(self, row: pd.Series, top_n: int = 5) -> Optional[list[tuple[str, float]]]:
         if self.preprocessor_ is None or self.background_ is None:

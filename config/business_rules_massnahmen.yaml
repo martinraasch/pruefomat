@@ -9,30 +9,49 @@ business_rules:
           - field: "Ampel"
             operator: "equals"
             value: 1
-          - field: "Betrag"
+          - field: "Betrag_parsed"
             operator: "less_than"
             value: 50000
       action:
         set_field: "Massnahme_2025"
         value: "Rechnungsprüfung"
       confidence: 1.0
+      description: "Grüne Ampel + Betrag < 50.000€ → Standardprüfung ausreichend"
+
+    - name: "hoher_betrag_gruene_ampel"
+      priority: 2
+      condition:
+        type: "and"
+        rules:
+          - field: "Ampel"
+            operator: "equals"
+            value: 1
+          - field: "Betrag_parsed"
+            operator: "greater_than_or_equal"
+            value: 50000
+      action:
+        set_field: "Massnahme_2025"
+        value: "Freigabe gemäß Kompetenzkatalog"
+      confidence: 1.0
+      description: "Grüne Ampel + Betrag ≥ 50.000€ → Höhere Freigabestufe erforderlich"
 
     - name: "historische_gutschrift_muster"
-      priority: 2
+      priority: 3
       condition:
         type: "feature_lookup"
         lookup_key:
           - "BUK"
           - "Debitor"
-        historical_action: "Gutschrift"
+        historical_action: "Gutschriftsverfahren"
         min_occurrences: 2
       action:
         set_field: "Massnahme_2025"
-        value: "Gutschrift"
+        value: "Gutschriftsverfahren"
       confidence: 0.9
+      description: "Bei BUK+Debitor-Kombination mit ≥2 historischen Gutschriften"
 
     - name: "negativ_rechnung"
-      priority: 3
+      priority: 4
       condition:
         type: "simple"
         rules:
@@ -43,6 +62,51 @@ business_rules:
         set_field: "Massnahme_2025"
         value: "Ablehnung"
       confidence: 1.0
+      description: "Negativ-Flag → keine Ankaufsentscheidung"
+
+    - name: "gelbe_ampel_nachweise"
+      priority: 10
+      condition:
+        type: "simple"
+        rules:
+          - field: "Ampel"
+            operator: "equals"
+            value: 2
+      action:
+        set_field: "Massnahme_2025"
+        value: "ML_PREDICTION"
+      confidence: null
+      description: "Gelbe Ampel → ML entscheidet zwischen Nachweisarten"
+      ml_allowed_classes:
+        - "Beibringung Liefer-/Leistungsnachweis (vorgelagert)"
+        - "Beibringung Liefer-/Leistungsnachweis (nachgelagert)"
+        - "Beibringung Auftrag/Bestellung/Vertrag (vorgelagert)"
+        - "Beibringung Auftrag/Bestellung/Vertrag (nachgelagert)"
+        - "telefonische Rechnungsbestätigung (vorgelagert)"
+        - "telefonische Rechnungsbestätigung (nachgelagert)"
+
+    - name: "rote_ampel_intensive_pruefung"
+      priority: 11
+      condition:
+        type: "simple"
+        rules:
+          - field: "Ampel"
+            operator: "equals"
+            value: 3
+      action:
+        set_field: "Massnahme_2025"
+        value: "ML_PREDICTION"
+      confidence: null
+      description: "Rote Ampel → ML entscheidet zwischen intensiven Prüfmaßnahmen"
+      ml_allowed_classes:
+        - "telefonische Lieferbestätigung (vorgelagert)"
+        - "telefonische Lieferbestätigung (nachgelagert)"
+        - "schriftliche Saldenbestätigung (vorgelagert)"
+        - "schriftliche Saldenbestätigung (nachgelagert)"
+        - "telefonische Saldenbestätigung (nachgelagert)"
+        - "schriftliche Rechnungsbestätigung beim DEB (vorgelagert)"
+        - "schriftliche Rechnungsbestätigung beim DEB (nachgelagert)"
+        - "nur zur Belegerfassung"
 
     - name: "ml_fallback"
       priority: 999
@@ -52,3 +116,23 @@ business_rules:
         set_field: "Massnahme_2025"
         value: "ML_PREDICTION"
       confidence: null
+      description: "Fallback für alle anderen Fälle"
+
+massnahmen_klassen:
+  - "Rechnungsprüfung"
+  - "Beibringung Liefer-/Leistungsnachweis (vorgelagert)"
+  - "Beibringung Liefer-/Leistungsnachweis (nachgelagert)"
+  - "Beibringung Auftrag/Bestellung/Vertrag (vorgelagert)"
+  - "Beibringung Auftrag/Bestellung/Vertrag (nachgelagert)"
+  - "telefonische Rechnungsbestätigung (vorgelagert)"
+  - "telefonische Rechnungsbestätigung (nachgelagert)"
+  - "telefonische Lieferbestätigung (vorgelagert)"
+  - "telefonische Lieferbestätigung (nachgelagert)"
+  - "schriftliche Saldenbestätigung (vorgelagert)"
+  - "schriftliche Saldenbestätigung (nachgelagert)"
+  - "telefonische Saldenbestätigung (nachgelagert)"
+  - "schriftliche Rechnungsbestätigung beim DEB (vorgelagert)"
+  - "schriftliche Rechnungsbestätigung beim DEB (nachgelagert)"
+  - "Freigabe gemäß Kompetenzkatalog"
+  - "nur zur Belegerfassung"
+  - "Gutschriftsverfahren"

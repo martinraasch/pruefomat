@@ -14,7 +14,9 @@ class RuleOperator(str, Enum):
     EQUALS = "equals"
     NOT_EQUALS = "not_equals"
     GREATER_THAN = "greater_than"
+    GREATER_THAN_OR_EQUAL = "greater_than_or_equal"
     LESS_THAN = "less_than"
+    LESS_THAN_OR_EQUAL = "less_than_or_equal"
     IN = "in"
     NOT_IN = "not_in"
 
@@ -38,6 +40,8 @@ class BusinessRule:
     lookup_keys: Optional[List[str]] = None
     historical_action: Optional[str] = None
     min_occurrences: Optional[int] = None
+    description: Optional[str] = None
+    ml_allowed_classes: Optional[List[str]] = None
 
 
 def _parse_operator(value: str) -> RuleOperator:
@@ -80,11 +84,15 @@ def _load_business_rules_structure(data: Dict[str, Any]) -> List[BusinessRule]:
         set_field = str(action.get("set_field", "")).strip()
         action_value = action.get("value")
         confidence = entry.get("confidence")
+        description = entry.get("description")
         lookup_keys = condition_block.get("lookup_key")
         if isinstance(lookup_keys, str):
             lookup_keys = [lookup_keys]
         historical_action = condition_block.get("historical_action")
         min_occurrences = condition_block.get("min_occurrences")
+        ml_allowed = entry.get("ml_allowed_classes")
+        if isinstance(ml_allowed, str):
+            ml_allowed = [ml_allowed]
 
         rules.append(
             BusinessRule(
@@ -98,6 +106,8 @@ def _load_business_rules_structure(data: Dict[str, Any]) -> List[BusinessRule]:
                 lookup_keys=list(lookup_keys) if lookup_keys else None,
                 historical_action=str(historical_action) if historical_action is not None else None,
                 min_occurrences=int(min_occurrences) if min_occurrences is not None else None,
+                description=str(description).strip() if description else None,
+                ml_allowed_classes=list(ml_allowed) if ml_allowed else None,
             )
         )
 

@@ -3,6 +3,7 @@ import pandas as pd
 
 from src.business_rules import BusinessRule, RuleOperator, SimpleCondition
 from src.rule_engine import RuleEngine
+from src.hybrid_predictor import HybridMassnahmenPredictor
 
 
 def _simple_rule(name: str, operator: RuleOperator, value, priority: int = 1):
@@ -31,13 +32,13 @@ def test_niedrig_betrag_gruene_ampel():
         confidence=1.0,
     )
     engine = RuleEngine([rule])
-    row = pd.Series({"Ampel": 1, "Betrag_parsed": 30000})
 
-    prediction, confidence, source = engine.evaluate(row)
-
-    assert prediction == "Rechnungsprüfung"
+    massnahme, confidence, _ = engine.evaluate(pd.Series({"Ampel": 1, "Betrag_parsed": 30000}))
+    assert massnahme == "Rechnungsprüfung"
     assert confidence == 1.0
-    assert source == "niedrig_betrag"
+
+    massnahme_high, _, _ = engine.evaluate(pd.Series({"Ampel": 1, "Betrag_parsed": 60000}))
+    assert massnahme_high is None
 
 
 def test_rule_engine_priority_order():
@@ -50,6 +51,26 @@ def test_rule_engine_priority_order():
 
     assert source == "high"
     assert prediction == "Rechnungsprüfung"
+
+
+def test_rule_operator_greater_equal():
+    rule = BusinessRule(
+        name="gte_rule",
+        priority=1,
+        condition_type="simple",
+        conditions=[SimpleCondition("Betrag_parsed", RuleOperator.GREATER_THAN_OR_EQUAL, 50000)],
+        action_field="Massnahme_2025",
+        action_value="Freigabe gemäß Kompetenzkatalog",
+        confidence=1.0,
+    )
+    engine = RuleEngine([rule])
+    row = pd.Series({"Betrag_parsed": 75000})
+
+    prediction, confidence, source = engine.evaluate(row)
+
+    assert prediction == "Freigabe gemäß Kompetenzkatalog"
+    assert confidence == 1.0
+    assert source == "gte_rule"
 
 
 def test_rule_engine_and_condition():
@@ -182,3 +203,63 @@ def test_rule_engine_missing_lookup_columns():
 
     assert prediction is None
     assert source == "no_match"
+def test_hoher_betrag_gruene_ampel():
+    rule = BusinessRule(
+        name="hoher_betrag",
+        priority=1,
+        condition_type="and",
+        conditions=[
+            SimpleCondition("Ampel", RuleOperator.EQUALS, 1),
+            SimpleCondition("Betrag_parsed", RuleOperator.GREATER_THAN_OR_EQUAL, 50000),
+        ],
+        action_field="Massnahme_2025",
+        action_value="Freigabe gemäß Kompetenzkatalog",
+        confidence=1.0,
+    )
+    engine = RuleEngine([rule])
+
+    assert engine.evaluate(pd.Series({"Ampel": 1, "Betrag_parsed": 50000}))[0] == "Freigabe gemäß Kompetenzkatalog"
+    assert engine.evaluate(pd.Series({"Ampel": 1, "Betrag_parsed": 50001}))[0] == "Freigabe gemäß Kompetenzkatalog"
+    assert engine.evaluate(pd.Series({"Ampel": 1, "Betrag_parsed": 49999}))[0] is None
+def test_ml_allowed_classes_restriction():
+    class MockModel:
+        classes_ = np.array(
+            [
+                "Rechnungsprüfung",
+                "Beibringung Liefer-/Leistungsnachweis (vorgelagert)",
+                "Beibringung Liefer-/Leistungsnachweis (nachgelagert)",
+                "telefonische Lieferbestätigung (vorgelagert)",
+            ]
+        )
+
+        def predict_proba(self, X):  # noqa: N802
+            proba = np.zeros(len(self.classes_), dtype=float)
+            proba[3] = 0.8
+            proba[1] = 0.15
+            proba[0] = 0.05
+            return np.array([proba])
+
+        def predict(self, X):  # noqa: N802
+            return np.array(["Rechnungsprüfung"] * len(X))
+
+    rule = BusinessRule(
+        name="gelbe_ampel",
+        priority=1,
+        condition_type="simple",
+        conditions=[SimpleCondition("Ampel", RuleOperator.EQUALS, 2)],
+        action_field="Massnahme_2025",
+        action_value="ML_PREDICTION",
+        confidence=None,
+        ml_allowed_classes=[
+            "Beibringung Liefer-/Leistungsnachweis (vorgelagert)",
+            "Beibringung Liefer-/Leistungsnachweis (nachgelagert)",
+            "Rechnungsprüfung",
+        ],
+    )
+    engine = RuleEngine([rule])
+    predictor = HybridMassnahmenPredictor(MockModel(), engine)
+
+    result = predictor.predict(pd.DataFrame([{"Ampel": 2}]))
+    chosen = result.loc[0, "prediction"]
+    assert chosen in rule.ml_allowed_classes
+    assert chosen != "telefonische Lieferbestätigung (vorgelagert)"
