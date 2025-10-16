@@ -55,7 +55,6 @@ import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import shap
 import yaml
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (balanced_accuracy_score, classification_report,
@@ -161,6 +160,12 @@ def _initial_state() -> Dict[str, Any]:
         "config_path": str(DEFAULT_CONFIG_PATH),
         "balance_classes": False,
         "bias_rules_yaml": "",
+        "hybrid_predictor": None,
+        "rule_engine": None,
+        "rule_metrics": {},
+        "massnahmen_distribution": None,
+        "label_encoder": None,
+        "label_classes": [],
     }
 
 
@@ -187,6 +192,15 @@ TRAINING_STATE_KEYS = {
     "shap_feature_names",
     "pattern_insights_df",
     "pattern_insights_path",
+    "hybrid_predictor",
+    "rule_engine",
+    "rule_metrics",
+    "massnahmen_distribution",
+    "label_encoder",
+    "label_classes",
+    "hybrid_results",
+    "business_rules",
+    "historical_training_data",
 }
 
 SYNTH_STATE_KEYS = {"last_generated_path", "last_quality_path", "bias_rules_yaml"}
@@ -309,6 +323,36 @@ def _write_inputs_payload(payload: Dict[str, Any]) -> str:
     file_path = tmp_dir / "inputs_snapshot.json"
     file_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return str(file_path)
+
+
+def _format_shap_table(entries: Optional[list[tuple[str, float]]]) -> str:
+    if not entries:
+        return "- Keine SHAP-Werte verfügbar."
+    lines = ["| Feature | SHAP-Wert |", "| --- | --- |"]
+    for feature, value in entries:
+        try:
+            value_float = float(value)
+        except (TypeError, ValueError):
+            value_float = 0.0
+        lines.append(f"| {feature} | {value_float:.4f} |")
+    return "\n".join(lines)
+
+
+def _format_conditions(conditions: Optional[list[Dict[str, Any]]]) -> str:
+    if not conditions:
+        return "- Keine Bedingungen ausgewertet."
+    lines = []
+    for entry in conditions:
+        matched = bool(entry.get("matched"))
+        status = "✅" if matched else "❌"
+        operator = entry.get("operator", "=")
+        target = entry.get("target")
+        value = entry.get("value")
+        field = entry.get("field", "")
+        lines.append(
+            f"{status} `{field} {operator}` (Soll: {target} | Ist: {value})"
+        )
+    return "\n".join(lines)
 
 
 def _load_text(path: Path | None) -> str:
@@ -1800,6 +1844,10 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     importance_df.sort_values("importance", ascending=False, inplace=True)
     top20 = importance_df.head(20).reset_index(drop=True)
 
+    hybrid_predictor.preprocessor_ = baseline.named_steps["preprocessor"]
+    hybrid_predictor.feature_names_ = list(feature_names)
+    hybrid_predictor.label_encoder_ = label_encoder
+
     proba = baseline.predict_proba(X_test)
     ml_confidence = proba.max(axis=1)
     ml_prediction = pd.Series(y_pred, name="ml_prediction").reset_index(drop=True)
@@ -1808,8 +1856,6 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     historical_df = X_train.copy()
     historical_df[config.data.target_col or "Massnahme_2025"] = y_train.reset_index(drop=True)
 
-    rule_engine = None
-    hybrid_results = None
     business_rules: List[BusinessRule] = []
     try:
         business_rules = load_business_rules_from_file(MASSNAHMEN_RULES_PATH)
@@ -1818,18 +1864,9 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("ui_rules_load_failed", message=str(exc))
 
-    if business_rules:
-        rule_engine = RuleEngine(business_rules, historical_data=historical_df)
-        hybrid_predictor = HybridMassnahmenPredictor(baseline, rule_engine)
-        hybrid_results = hybrid_predictor.predict(X_test.reset_index(drop=True))
-    else:
-        hybrid_results = pd.DataFrame(
-            {
-                "prediction": ml_prediction,
-                "confidence": ml_confidence_series,
-                "source": ["ml"] * len(ml_prediction),
-            }
-        )
+    rule_engine = RuleEngine(business_rules, historical_data=historical_df)
+    hybrid_predictor = HybridMassnahmenPredictor(baseline, rule_engine)
+    hybrid_results = hybrid_predictor.predict(X_test.reset_index(drop=True))
 
     final_prediction = ml_prediction.copy()
     final_confidence = ml_confidence_series.copy()
@@ -1868,6 +1905,16 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     predictions_df.sort_values("final_confidence", ascending=False, inplace=True)
     predictions_display = predictions_df.head(50).reset_index(drop=True)
 
+    rule_source_series = pd.Series(applied_rule, dtype="object")
+    rule_coverage = float(rule_source_series.notna().mean()) if not rule_source_series.empty else 0.0
+    ml_fallback_rate = float(rule_source_series.isna().mean()) if not rule_source_series.empty else 0.0
+    metrics["rule_coverage"] = rule_coverage
+    metrics["ml_fallback_rate"] = ml_fallback_rate
+
+    distribution_df = (
+        predictions_df["final_prediction"].astype("string").value_counts().rename_axis("Massnahme").reset_index(name="Anzahl")
+    )
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_model_"))
     model_path = tmp_dir / "baseline_model.joblib"
     metrics_path = tmp_dir / "metrics.json"
@@ -1893,6 +1940,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     metrics_serializable = {
         **metrics,
         "confusion_matrix": confusion.tolist(),
+        "massnahmen_distribution": distribution_df.to_dict(orient="records"),
     }
     metrics_path.write_text(json.dumps(metrics_serializable, indent=2), encoding="utf-8")
 
@@ -1913,6 +1961,9 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "business_rules": business_rules,
             "historical_training_data": historical_df,
             "hybrid_results": hybrid_results,
+            "hybrid_predictor": hybrid_predictor,
+            "rule_metrics": {"rule_coverage": rule_coverage, "ml_fallback_rate": ml_fallback_rate},
+            "massnahmen_distribution": distribution_df,
         }
     )
 
@@ -1927,6 +1978,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         background = baseline.named_steps["preprocessor"].transform(df_features.head(background_size))
         background_dense = background.toarray() if hasattr(background, "toarray") else background
         state["shap_background"] = background_dense
+        hybrid_predictor.background_ = background_dense
     except Exception as exc:
         logger.warning("ui_shap_background_failed", message=str(exc))
 
@@ -1942,6 +1994,10 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
 
     logger.info("ui_baseline_trained", **mask_sensitive_data(metric_summary))
 
+    rule_coverage_display = f"{rule_coverage:.1%}"
+    ml_fallback_display = f"{ml_fallback_rate:.1%}"
+    distribution_display = distribution_df.copy()
+
     return (
         "Baseline trainiert.",
         metrics,
@@ -1953,15 +2009,19 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         str(importance_path),
         predictions_display,
         str(predictions_path),
+        rule_coverage_display,
+        ml_fallback_display,
+        distribution_display,
         state,
     )
 
 
-def explain_prediction_action(state: Optional[Dict[str, Any]], row_index):
+def explain_massnahme_action(state: Optional[Dict[str, Any]], row_index):
     state = state or {}
-    baseline = state.get("baseline_model")
+    hybrid_predictor: Optional[HybridMassnahmenPredictor] = state.get("hybrid_predictor")
     df_features = state.get("df_features")
-    if baseline is None or df_features is None:
+
+    if hybrid_predictor is None or df_features is None:
         return "Bitte zuerst Baseline trainieren.", None, None, state
 
     try:
@@ -1970,110 +2030,44 @@ def explain_prediction_action(state: Optional[Dict[str, Any]], row_index):
         return "Ungültiger Index.", None, None, state
 
     if idx < 0 or idx >= len(df_features):
-        return f"Index muss zwischen 0 und {len(df_features)-1} liegen.", None, None, state
+        return f"Index muss zwischen 0 und {len(df_features) - 1} liegen.", None, None, state
 
-    preprocessor = baseline.named_steps.get("preprocessor")
-    classifier = baseline.named_steps.get("classifier")
-    if preprocessor is None or classifier is None:
-        return "Pipeline unvollständig.", None, None, state
+    row = df_features.iloc[idx]
+    explanation = hybrid_predictor.explain(row)
+    prediction_label = explanation.get("prediction")
+    source = explanation.get("source", "ml") or "ml"
+    confidence = explanation.get("confidence")
+    confidence_text = f"{confidence:.1%}" if isinstance(confidence, (int, float)) else "n/a"
 
-    if not hasattr(classifier, "estimators_"):
-        return "Erklärungen unterstützen derzeit nur Baum-Modelle (z. B. RandomForest).", None, None, state
+    if source == "ml":
+        shap_table = _format_shap_table(explanation.get("details", {}).get("shap_top5"))
+        formatted = textwrap.dedent(
+            f"""
+            ### ML-Prediction: {prediction_label}
+            **Confidence:** {confidence_text}
 
-    feature_names = state.get("shap_feature_names")
-    if feature_names is None:
-        try:
-            feature_names = preprocessor.get_feature_names_out().tolist()
-        except Exception:
-            transformed = preprocessor.transform(df_features.head(1))
-            feature_names = [f"f_{i}" for i in range(transformed.shape[1])]
-        state["shap_feature_names"] = feature_names
+            **Top SHAP-Features:**
+            {shap_table}
+            """
+        ).strip()
+    else:
+        conditions_markdown = _format_conditions(explanation.get("details", {}).get("matched_conditions"))
+        formatted = textwrap.dedent(
+            f"""
+            ### Rule-Based: {prediction_label}
+            **Regel:** {source}
+            **Confidence:** {confidence_text}
 
-    sample = df_features.iloc[[idx]]
-    transformed = preprocessor.transform(sample)
-    transformed_dense = transformed.toarray() if hasattr(transformed, "toarray") else transformed
+            **Erfüllte Bedingungen:**
+            {conditions_markdown}
+            """
+        ).strip()
 
-    background = state.get("shap_background")
-    if background is None:
-        bg = preprocessor.transform(df_features.head(min(200, len(df_features))))
-        background = bg.toarray() if hasattr(bg, "toarray") else bg
-        state["shap_background"] = background
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_massnahme_"))
+    md_path = tmp_dir / f"explanation_{idx}.md"
+    md_path.write_text(formatted, encoding="utf-8")
 
-    class_names = list(getattr(classifier, "classes_", []))
-    try:
-        explainer = shap.TreeExplainer(classifier, background)
-        shap_values = explainer.shap_values(transformed_dense)
-        if isinstance(shap_values, list):
-            try:
-                proba = baseline.predict_proba(sample)
-                class_index = int(np.argmax(proba[0])) if proba.ndim == 2 else 0
-            except Exception:  # pragma: no cover - defensive
-                class_index = 0
-            class_index = max(0, min(class_index, len(shap_values) - 1))
-            shap_row = shap_values[class_index][0]
-        else:
-            shap_row = shap_values[0]
-    except Exception as exc:
-        logger.error("ui_shap_failed", message=str(exc))
-        return f"SHAP konnte nicht berechnet werden: {exc}", None, None, state
-
-    state["shap_classes"] = class_names
-
-    shap_row = np.asarray(shap_row)
-    if shap_row.ndim > 1:
-        shap_row = shap_row.reshape(-1)
-    try:
-        shap_row = shap_row.astype(float, copy=False)
-    except (TypeError, ValueError):
-        flattened = []
-        for val in np.asarray(shap_row, dtype=object).ravel():
-            arr = np.asarray(val)
-            if arr.size == 0:
-                continue
-            flattened.extend(arr.astype(float, copy=False).ravel().tolist())
-        shap_row = np.array(flattened, dtype=float)
-
-    values_array = transformed_dense[0]
-    values_array = np.asarray(values_array)
-    if values_array.ndim > 1:
-        values_array = values_array.reshape(-1)
-    values_array = values_array.astype(float, copy=False)
-
-    feature_array = np.asarray(feature_names, dtype=str)
-    lengths = (len(feature_array), shap_row.size, values_array.size)
-    if len(set(lengths)) != 1:
-        min_len = min(lengths)
-        logger.warning(
-            "ui_shap_length_mismatch",
-            feature_count=len(feature_array),
-            shap_len=shap_row.size,
-            value_len=values_array.size,
-            truncated_to=min_len,
-        )
-        feature_array = feature_array[:min_len]
-        shap_row = shap_row[:min_len]
-        values_array = values_array[:min_len]
-
-    if shap_row.size == 0:
-        return "Keine SHAP-Werte für diese Zeile verfügbar.", None, None, state
-
-    order = np.argsort(np.abs(shap_row))[::-1][:5]
-    explanation = []
-    for i in order:
-        explanation.append(
-            {
-                "feature": feature_array[i],
-                "shap_value": float(shap_row[i]),
-                "feature_value": float(values_array[i]),
-                "impact": "erhöht Risiko" if shap_row[i] >= 0 else "senkt Risiko",
-            }
-        )
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_shap_"))
-    json_path = tmp_dir / "explanation.json"
-    json_path.write_text(json.dumps(explanation, indent=2), encoding="utf-8")
-
-    return f"Top-Features für Zeile {idx}", explanation, str(json_path), state
+    return "Erklärung generiert", formatted, str(md_path), state
 
 
 def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
@@ -2203,14 +2197,23 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
         df_input[col] = np.nan
     df_input = df_input[selected_columns]
 
-    rule_engine = state.get("rule_engine")
     progress(0.3, desc="Berechne Vorhersagen")
     proba = model.predict_proba(df_input)
     ml_prediction = model.predict(df_input)
     ml_confidence = proba.max(axis=1)
 
-    if rule_engine is not None:
+    hybrid_predictor = state.get("hybrid_predictor")
+    rule_engine = state.get("rule_engine")
+    if hybrid_predictor is None and rule_engine is not None:
         hybrid_predictor = HybridMassnahmenPredictor(model, rule_engine)
+        hybrid_predictor.preprocessor_ = model.named_steps.get("preprocessor")
+        hybrid_predictor.feature_names_ = state.get("shap_feature_names")
+        shap_background = state.get("shap_background")
+        if shap_background is not None:
+            hybrid_predictor.background_ = shap_background
+        state["hybrid_predictor"] = hybrid_predictor
+
+    if hybrid_predictor is not None:
         hybrid_results = hybrid_predictor.predict(df_input.reset_index(drop=True))
     else:
         hybrid_results = pd.DataFrame(
@@ -2474,6 +2477,10 @@ def handle_menu_action(
     synth_seed,
     synth_debug,
     batch_file,
+    rule_coverage_box,
+    ml_fallback_box,
+    massnahmen_distribution_plot,
+    rule_explanation_component,
     *,
     defaults: Dict[str, Any],
 ):
@@ -2502,6 +2509,12 @@ def handle_menu_action(
             "configuration": {
                 "selected_columns": column_selector,
                 "balance_classes": balance_checkbox,
+            },
+            "analysis": {
+                "rule_coverage": rule_coverage_box,
+                "ml_fallback": ml_fallback_box,
+                "distribution": massnahmen_distribution_plot,
+                "explanation": rule_explanation_component,
             },
             "synthetic": {
                 "base_file": synth_base,
@@ -2693,13 +2706,8 @@ def build_interface() -> gr.Blocks:
                 importance_table = gr.Dataframe(label="Feature Importanzen (Top 20)", interactive=False)
                 importance_plot = gr.Image(label="Feature Importance Chart", interactive=False)
                 importance_download = gr.File(label="Feature Importances CSV", interactive=False)
-                predictions_table = gr.Dataframe(label="Predictions (Test Set, sortiert nach Risiko)", interactive=False)
+                predictions_table = gr.Dataframe(label="Predictions (Test Set, sortiert nach Vertrauen)", interactive=False)
                 predictions_download = gr.File(label="Predictions CSV", interactive=False)
-                explain_index = gr.Number(label="Zeilenindex für Erklärung", value=0, precision=0)
-                explain_btn = gr.Button("Erklärung anzeigen")
-                explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
-                explain_json = gr.JSON(label="Top-Features (SHAP)")
-                explain_download = gr.File(label="Erklärungs-JSON", interactive=False)
                 report_btn = gr.Button("Pattern Report generieren")
                 report_status = gr.Textbox(label="Report-Status", interactive=False)
                 report_preview = gr.Markdown(label="Report Vorschau")
@@ -2718,6 +2726,25 @@ def build_interface() -> gr.Blocks:
                 feedback_report_status = gr.Textbox(label="Feedback-Report-Status", interactive=False)
                 feedback_report_preview = gr.Markdown(label="Feedback Report Vorschau")
                 feedback_report_download = gr.File(label="Feedback Report Download", interactive=False)
+
+            with gr.Tab("Maßnahmen-Analyse"):
+                gr.Markdown("## Hybrid Prediction: Rules + ML")
+                with gr.Row():
+                    rule_coverage_box = gr.Textbox(label="Rule Coverage", interactive=False)
+                    ml_fallback_box = gr.Textbox(label="ML Fallback Rate", interactive=False)
+                massnahmen_distribution_plot = gr.BarPlot(
+                    label="Verteilung vorhergesagter Maßnahmen",
+                    x="Massnahme",
+                    y="Anzahl",
+                )
+
+                gr.Markdown("### Einzel-Erklärung")
+                with gr.Row():
+                    explain_index = gr.Number(label="Zeilenindex", value=0, precision=0)
+                    explain_btn = gr.Button("Erklärung anzeigen")
+                explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
+                rule_explanation = gr.Markdown(label="Erklärung")
+                explain_download = gr.File(label="Erklärungs-Download", interactive=False)
 
             with gr.Tab("Konfiguration"):
                 config_info = gr.JSON(label="Aktive Konfiguration", value={})
@@ -2880,9 +2907,12 @@ def build_interface() -> gr.Blocks:
             ("importance_download", importance_download),
             ("predictions_table", predictions_table),
             ("predictions_download", predictions_download),
+            ("rule_coverage", rule_coverage_box),
+            ("ml_fallback", ml_fallback_box),
+            ("massnahmen_distribution", massnahmen_distribution_plot),
             ("explain_index", explain_index),
             ("explain_status", explain_status),
-            ("explain_json", explain_json),
+            ("rule_explanation", rule_explanation),
             ("explain_download", explain_download),
             ("report_status", report_status),
             ("report_preview", report_preview),
@@ -2954,9 +2984,12 @@ def build_interface() -> gr.Blocks:
             "importance_download": gr.update(value=None),
             "predictions_table": gr.update(value=None),
             "predictions_download": gr.update(value=None),
+            "rule_coverage": "",
+            "ml_fallback": "",
+            "massnahmen_distribution": gr.update(value=None),
             "explain_index": 0,
             "explain_status": "",
-            "explain_json": gr.update(value=None),
+            "rule_explanation": gr.update(value=""),
             "explain_download": gr.update(value=None),
             "report_status": "",
             "report_preview": gr.update(value=""),
@@ -3049,6 +3082,10 @@ def build_interface() -> gr.Blocks:
                 synth_seed,
                 synth_debug,
                 batch_file,
+                rule_coverage_box,
+                ml_fallback_box,
+                massnahmen_distribution_plot,
+                rule_explanation,
             ],
             outputs=menu_outputs,
         )
@@ -3135,14 +3172,17 @@ def build_interface() -> gr.Blocks:
                 importance_download,
                 predictions_table,
                 predictions_download,
+                rule_coverage_box,
+                ml_fallback_box,
+                massnahmen_distribution_plot,
                 state,
             ],
         )
 
         explain_btn.click(
-            explain_prediction_action,
+            explain_massnahme_action,
             inputs=[state, explain_index],
-            outputs=[explain_status, explain_json, explain_download, state],
+            outputs=[explain_status, rule_explanation, explain_download, state],
         )
 
         report_btn.click(

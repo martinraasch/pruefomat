@@ -1,8 +1,8 @@
 business_rules:
   version: "1.0"
   rules:
-  # Regel 1: Grüne Ampel + niedriger Betrag
-  - name: "niedrig_betrag_gruene_ampel"
+    # Regel 1: Grüne Ampel + niedriger Betrag
+    - name: "niedrig_betrag_gruene_ampel"
     priority: 1
     condition:
       type: "and"
@@ -18,8 +18,8 @@ business_rules:
       value: "Rechnungsprüfung"
     confidence: 1.0
 
-  # Regel 2: Historisches Gutschrift-Muster
-  - name: "historische_gutschrift_muster"
+    # Regel 2: Historisches Gutschrift-Muster
+    - name: "historische_gutschrift_muster"
     priority: 2
     condition:
       type: "feature_lookup"
@@ -31,8 +31,8 @@ business_rules:
       value: "Gutschrift"
     confidence: 0.9
 
-  # Regel 3: Negativ-Rechnung
-  - name: "negativ_rechnung"
+    # Regel 3: Negativ-Rechnung
+    - name: "negativ_rechnung"
     priority: 3
     condition:
       type: "simple"
@@ -45,8 +45,8 @@ business_rules:
       value: "Ablehnung"
     confidence: 1.0
 
-  # Fallback: ML-Prediction verwenden
-  - name: "ml_fallback"
+    # Fallback: ML-Prediction verwenden
+    - name: "ml_fallback"
     priority: 999
     condition:
       type: "always"

@@ -12,7 +12,7 @@ from app import (
     FEEDBACK_DB_PATH,
     build_pipeline_action,
     batch_predict_action,
-    explain_prediction_action,
+    explain_massnahme_action,
     feedback_fp_action,
     feedback_report_action,
     feedback_tp_action,
@@ -176,7 +176,7 @@ def test_threshold_application(baseline_state):
 
 def test_shap_explanations(baseline_state):
     _, _, state = baseline_state
-    status, explanation, download_path, _ = explain_prediction_action(state, 0)
+    status, explanation, download_path, _ = explain_massnahme_action(state, 0)
     assert "Top-Features" in status
     assert isinstance(explanation, list)
     assert len(explanation) == 5
