@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 
 from src.business_rules import BusinessRule, RuleOperator, SimpleCondition
@@ -16,16 +17,27 @@ def _simple_rule(name: str, operator: RuleOperator, value, priority: int = 1):
     )
 
 
-def test_rule_engine_simple_match():
-    rule = _simple_rule("rule_eq", RuleOperator.EQUALS, 1)
+def test_niedrig_betrag_gruene_ampel():
+    rule = BusinessRule(
+        name="niedrig_betrag",
+        priority=1,
+        condition_type="and",
+        conditions=[
+            SimpleCondition("Ampel", RuleOperator.EQUALS, 1),
+            SimpleCondition("Betrag_parsed", RuleOperator.LESS_THAN, 50000),
+        ],
+        action_field="Massnahme_2025",
+        action_value="Rechnungsprüfung",
+        confidence=1.0,
+    )
     engine = RuleEngine([rule])
-    row = pd.Series({"Ampel": 1})
+    row = pd.Series({"Ampel": 1, "Betrag_parsed": 30000})
 
     prediction, confidence, source = engine.evaluate(row)
 
     assert prediction == "Rechnungsprüfung"
     assert confidence == 1.0
-    assert source == "rule_eq"
+    assert source == "niedrig_betrag"
 
 
 def test_rule_engine_priority_order():
@@ -84,10 +96,18 @@ def test_rule_engine_or_condition():
     assert source == "or_rule"
 
 
-def test_rule_engine_lookup_condition():
-    lookup_rule = BusinessRule(
-        name="lookup",
-        priority=1,
+def test_historische_gutschrift_muster():
+    historical_df = pd.DataFrame(
+        {
+            "BUK": ["A", "A", "A", "B"],
+            "Debitor": ["100", "100", "100", "200"],
+            "Massnahme_2025": ["Gutschrift", "Gutschrift", "Gutschrift", "Prüfung"],
+        }
+    )
+
+    rule = BusinessRule(
+        name="gutschrift_lookup",
+        priority=2,
         condition_type="feature_lookup",
         conditions=[],
         action_field="Massnahme_2025",
@@ -98,22 +118,14 @@ def test_rule_engine_lookup_condition():
         min_occurrences=2,
     )
 
-    history = pd.DataFrame(
-        {
-            "BUK": ["100", "100", "200"],
-            "Debitor": ["A", "A", "B"],
-            "Massnahme_2025": ["Gutschrift", "Gutschrift", "Rechnungsprüfung"],
-        }
-    )
+    engine = RuleEngine([rule], historical_data=historical_df)
 
-    engine = RuleEngine([lookup_rule], historical_data=history)
-    row = pd.Series({"BUK": "100", "Debitor": "A"})
+    prediction_match, confidence_match, _ = engine.evaluate(pd.Series({"BUK": "A", "Debitor": "100"}))
+    prediction_nomatch, _, _ = engine.evaluate(pd.Series({"BUK": "B", "Debitor": "200"}))
 
-    prediction, confidence, source = engine.evaluate(row)
-
-    assert prediction == "Gutschrift"
-    assert confidence == 0.9
-    assert source == "lookup"
+    assert prediction_match == "Gutschrift"
+    assert confidence_match == 0.9
+    assert prediction_nomatch is None
 
 
 def test_rule_engine_ml_fallback_signal():
@@ -134,3 +146,39 @@ def test_rule_engine_ml_fallback_signal():
     assert prediction is None
     assert confidence is None
     assert source == "ml_fallback"
+
+
+def test_rule_engine_handles_missing_values():
+    rule = _simple_rule("rule_eq", RuleOperator.EQUALS, 1)
+    engine = RuleEngine([rule])
+    row = pd.Series({"Ampel": np.nan})
+
+    prediction, confidence, source = engine.evaluate(row)
+
+    assert prediction is None
+    assert confidence is None
+    assert source == "no_match"
+
+
+def test_rule_engine_missing_lookup_columns():
+    rule = BusinessRule(
+        name="lookup_missing",
+        priority=1,
+        condition_type="feature_lookup",
+        conditions=[],
+        action_field="Massnahme_2025",
+        action_value="Gutschrift",
+        confidence=0.9,
+        lookup_keys=["BUK", "Debitor"],
+        historical_action="Gutschrift",
+        min_occurrences=1,
+    )
+
+    history = pd.DataFrame({"BUK": ["X"], "Debitor": ["Y"], "Massnahme_2025": ["Gutschrift"]})
+    engine = RuleEngine([rule], historical_data=history)
+
+    row = pd.Series({"BUK": "X"})  # missing Debitor
+    prediction, _, source = engine.evaluate(row)
+
+    assert prediction is None
+    assert source == "no_match"
