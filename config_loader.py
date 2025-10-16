@@ -53,10 +53,18 @@ class DataSection(BaseModel):
     numeric_columns: list[str] = Field(default_factory=list)
     categorical_columns: list[str] = Field(default_factory=list)
     text_columns: list[str] = Field(default_factory=list)
+    flag_columns: list[str] = Field(default_factory=list)
     target_col: Optional[str] = None
     null_like: list[str] = Field(default_factory=list)
 
-    @field_validator("additional_date_columns", "numeric_columns", "categorical_columns", "text_columns", "null_like")
+    @field_validator(
+        "additional_date_columns",
+        "numeric_columns",
+        "categorical_columns",
+        "text_columns",
+        "flag_columns",
+        "null_like",
+    )
     @classmethod
     def _normalize_list(cls, value: list[str]) -> list[str]:
         return [str(item) for item in value]
@@ -165,6 +173,7 @@ def normalize_config_columns(config: AppConfig) -> AppConfig:
     data_cfg.numeric_columns = [_normalize_name(col) for col in data_cfg.numeric_columns]
     data_cfg.categorical_columns = [_normalize_name(col) for col in data_cfg.categorical_columns]
     data_cfg.text_columns = [_normalize_name(col) for col in data_cfg.text_columns]
+    data_cfg.flag_columns = [_normalize_name(col) for col in data_cfg.flag_columns]
     data_cfg.null_like = [str(item) for item in data_cfg.null_like]
     return config
 

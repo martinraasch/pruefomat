@@ -1,0 +1,56 @@
+business_rules:
+  version: "1.0"
+
+  # Regel 1: Grüne Ampel + niedriger Betrag
+  - name: "niedrig_betrag_gruene_ampel"
+    priority: 1
+    condition:
+      type: "and"
+      rules:
+        - field: "Ampel"
+          operator: "equals"
+          value: 1
+        - field: "Betrag"
+          operator: "less_than"
+          value: 50000
+    action:
+      set_field: "Massnahme_2025"
+      value: "Rechnungsprüfung"
+    confidence: 1.0
+
+  # Regel 2: Historisches Gutschrift-Muster
+  - name: "historische_gutschrift_muster"
+    priority: 2
+    condition:
+      type: "feature_lookup"
+      lookup_key: ["BUK", "Debitor"]
+      historical_action: "Gutschrift"
+      min_occurrences: 2
+    action:
+      set_field: "Massnahme_2025"
+      value: "Gutschrift"
+    confidence: 0.9
+
+  # Regel 3: Negativ-Rechnung
+  - name: "negativ_rechnung"
+    priority: 3
+    condition:
+      type: "simple"
+      rules:
+        - field: "negativ"
+          operator: "equals"
+          value: true
+    action:
+      set_field: "Massnahme_2025"
+      value: "Ablehnung"
+    confidence: 1.0
+
+  # Fallback: ML-Prediction verwenden
+  - name: "ml_fallback"
+    priority: 999
+    condition:
+      type: "always"
+    action:
+      set_field: "Massnahme_2025"
+      value: "ML_PREDICTION"
+    confidence: null

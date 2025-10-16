@@ -8,8 +8,9 @@ import sqlite3
 import tempfile
 import textwrap
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import sys
 import logging
 import re
@@ -148,6 +149,43 @@ except ConfigError:
     DEFAULT_CONFIG = normalize_config_columns(DEFAULT_CONFIG)
 
 
+def _initial_state() -> Dict[str, Any]:
+    return {
+        "config": DEFAULT_CONFIG.model_copy(deep=True),
+        "config_path": str(DEFAULT_CONFIG_PATH),
+        "balance_classes": False,
+        "bias_rules_yaml": "",
+    }
+
+
+TRAINING_STATE_KEYS = {
+    "excel_paths",
+    "excel_path",
+    "sheet",
+    "column_mapping",
+    "df_features",
+    "df_features_full",
+    "target",
+    "target_name",
+    "target_mapping",
+    "selected_columns",
+    "preprocessor",
+    "feature_plan",
+    "prep_path",
+    "baseline_model",
+    "baseline_path",
+    "metrics_path",
+    "feature_importance_df",
+    "notes_text_vectorizer",
+    "shap_background",
+    "shap_feature_names",
+    "pattern_insights_df",
+    "pattern_insights_path",
+}
+
+SYNTH_STATE_KEYS = {"last_generated_path", "last_quality_path", "bias_rules_yaml"}
+
+
 # ---------------------------------------------------------------------------
 # Gradio schema monkey-patch (4.44.0 bug fix)
 # ---------------------------------------------------------------------------
@@ -204,6 +242,67 @@ def _reset_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("preprocessor", "feature_plan", "prep_path", "baseline_model", "baseline_path", "metrics_path"):
         state.pop(key, None)
     return state
+
+
+def _clear_state_keys(state: Dict[str, Any], keys: Iterable[str]) -> Dict[str, Any]:
+    for key in keys:
+        state.pop(key, None)
+    return state
+
+
+def _serialize_component_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, pd.DataFrame):
+        return {
+            "columns": list(value.columns),
+            "rows": int(len(value)),
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_serialize_component_value(item) for item in value]
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, val in value.items():
+            if key in {"data", "file", "binary", "base64"}:
+                continue
+            sanitized[key] = _serialize_component_value(val)
+        return sanitized
+    if hasattr(value, "name") and hasattr(value, "size"):
+        return {
+            "name": getattr(value, "name", ""),
+            "size": getattr(value, "size", None),
+        }
+    try:
+        return value.__dict__
+    except AttributeError:
+        return str(value)
+
+
+def _build_inputs_payload(state: Dict[str, Any], sections: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    timestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    serialized_sections = {
+        section: {name: _serialize_component_value(val) for name, val in values.items()}
+        for section, values in sections.items()
+    }
+    snapshot = {
+        "created_at": timestamp,
+        "config_path": state.get("config_path"),
+        "target": state.get("target_name"),
+        "balance_classes": state.get("balance_classes", False),
+        "sections": serialized_sections,
+    }
+    return snapshot
+
+
+def _write_inputs_payload(payload: Dict[str, Any]) -> str:
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_inputs_"))
+    file_path = tmp_dir / "inputs_snapshot.json"
+    file_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return str(file_path)
 
 
 def _load_text(path: Path | None) -> str:
@@ -2235,6 +2334,164 @@ def analyze_patterns_action(state: Optional[Dict[str, Any]]):
     return status, markdown, str(csv_path), state
 
 
+def handle_menu_action(
+    action: Optional[str],
+    state: Optional[Dict[str, Any]],
+    file_input,
+    folder_input,
+    config_input,
+    sheet_input,
+    target_input,
+    explain_index,
+    feedback_user,
+    feedback_comment,
+    feedback_index,
+    column_selector,
+    balance_checkbox,
+    synth_base,
+    synth_config,
+    synth_business_rules,
+    synth_profile,
+    synth_business_rules_text,
+    synth_profile_text,
+    synth_gpt_enable,
+    synth_gpt_model,
+    synth_gpt_key,
+    synth_bias_prompt,
+    synth_bias_yaml,
+    synth_variation,
+    synth_lines,
+    synth_ratio,
+    synth_seed,
+    synth_debug,
+    batch_file,
+    *,
+    defaults: Dict[str, Any],
+):
+    action_key = defaults["action_map"].get(action)
+    state_copy = dict(state) if state else _initial_state()
+    updated_state = state_copy
+
+    outputs: Dict[str, Any] = {name: gr.update() for name in defaults["output_names"]}
+    component_updates: Dict[str, Any] = {}
+    menu_status = "Bitte eine Menü-Aktion auswählen."
+    menu_download_value: Any = gr.update()
+
+    if action_key == "save":
+        sections = {
+            "training": {
+                "files": file_input,
+                "folder": folder_input,
+                "config_file": config_input,
+                "sheet": sheet_input,
+                "target": target_input,
+                "explain_index": explain_index,
+                "feedback_user": feedback_user,
+                "feedback_comment": feedback_comment,
+                "feedback_index": feedback_index,
+            },
+            "configuration": {
+                "selected_columns": column_selector,
+                "balance_classes": balance_checkbox,
+            },
+            "synthetic": {
+                "base_file": synth_base,
+                "config_file": synth_config,
+                "business_rules_file": synth_business_rules,
+                "profile_file": synth_profile,
+                "business_rules_text": synth_business_rules_text,
+                "profile_text": synth_profile_text,
+                "gpt_enable": synth_gpt_enable,
+                "gpt_model": synth_gpt_model,
+                "gpt_key": synth_gpt_key,
+                "bias_prompt": synth_bias_prompt,
+                "bias_yaml": synth_bias_yaml,
+                "variation": synth_variation,
+                "lines": synth_lines,
+                "ratio": synth_ratio,
+                "seed": synth_seed,
+                "debug": synth_debug,
+            },
+            "batch_prediction": {
+                "batch_file": batch_file,
+            },
+        }
+        payload = _build_inputs_payload(state_copy, sections)
+        menu_download_value = _write_inputs_payload(payload)
+        menu_status = "Eingaben als JSON gespeichert."
+    elif action_key == "reset_all":
+        updated_state = _initial_state()
+        component_updates.update(defaults["training_reset"])
+        component_updates.update(defaults["synth_reset"])
+        component_updates.update(defaults["batch_reset"])
+        component_updates["config_info"] = gr.update(value={})
+        component_updates["column_selector"] = gr.update(value=[], choices=[])
+        component_updates["balance_checkbox"] = gr.update(value=False)
+        menu_download_value = gr.update(value=None)
+        menu_status = "Alle Tabs zurückgesetzt."
+    elif action_key == "reset_training":
+        updated_state = dict(state_copy)
+        updated_state = _clear_state_keys(updated_state, TRAINING_STATE_KEYS)
+        updated_state = _reset_pipeline_state(updated_state)
+        updated_state["balance_classes"] = False
+        component_updates.update(defaults["training_reset"])
+        component_updates["config_info"] = gr.update(value={})
+        component_updates["column_selector"] = gr.update(value=[], choices=[])
+        component_updates["balance_checkbox"] = gr.update(value=False)
+        menu_download_value = gr.update(value=None)
+        menu_status = "Training & Analyse zurückgesetzt."
+    elif action_key == "reset_config":
+        updated_state = dict(state_copy)
+        df_full = updated_state.get("df_features_full")
+        component_updates["balance_checkbox"] = gr.update(value=False)
+        updated_state["balance_classes"] = False
+        if isinstance(df_full, pd.DataFrame) and not df_full.empty:
+            available_columns = list(df_full.columns)
+            default_columns = [c for c in available_columns if c not in AUTO_EXCLUDE_FEATURES]
+            if not default_columns:
+                default_columns = available_columns
+            updated_state["selected_columns"] = default_columns
+            if default_columns:
+                updated_state["df_features"] = df_full[default_columns].copy()
+            else:
+                updated_state["df_features"] = df_full.iloc[:, 0:0].copy()
+            component_updates["column_selector"] = gr.update(value=default_columns, choices=available_columns)
+            component_updates["config_info"] = _build_config_overview(updated_state)
+            status_text = (
+                f"{len(default_columns)} Spalten automatisch ausgewählt."
+                if default_columns
+                else "Keine Spalten ausgewählt."
+            )
+            component_updates["column_status"] = status_text
+            menu_status = "Konfiguration auf Standardauswahl zurückgesetzt."
+        else:
+            updated_state = _clear_state_keys(updated_state, {"selected_columns", "df_features"})
+            component_updates["column_selector"] = gr.update(value=[], choices=[])
+            component_updates["config_info"] = gr.update(value={})
+            component_updates["column_status"] = ""
+            menu_status = "Keine Daten geladen – Konfiguration geleert."
+        menu_download_value = gr.update(value=None)
+    elif action_key == "reset_synth":
+        updated_state = dict(state_copy)
+        updated_state = _clear_state_keys(updated_state, SYNTH_STATE_KEYS)
+        updated_state["bias_rules_yaml"] = ""
+        component_updates.update(defaults["synth_reset"])
+        menu_download_value = gr.update(value=None)
+        menu_status = "Synthetik-Tab zurückgesetzt."
+    elif action_key == "reset_batch":
+        component_updates.update(defaults["batch_reset"])
+        menu_download_value = gr.update(value=None)
+        menu_status = "Batch Prediction zurückgesetzt."
+
+    outputs["menu_status"] = menu_status
+    outputs["menu_download"] = menu_download_value
+    outputs["state"] = updated_state
+    for key, value in component_updates.items():
+        outputs[key] = value
+
+    return tuple(outputs[name] for name in defaults["output_names"])
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -2267,12 +2524,31 @@ def build_interface() -> gr.Blocks:
             """
         )
 
-        state = gr.State({
-            "config": DEFAULT_CONFIG.model_copy(deep=True),
-            "config_path": str(DEFAULT_CONFIG_PATH),
-            "balance_classes": False,
-            "bias_rules_yaml": "",
-        })
+        state = gr.State(_initial_state())
+        target_default = DEFAULT_CONFIG.data.target_col or ""
+        sheet_default = "0"
+
+        menu_action_map = {
+            "💾 Eingaben speichern": "save",
+            "♻️ Alles zurücksetzen": "reset_all",
+            "🧹 Training & Analyse zurücksetzen": "reset_training",
+            "🧭 Konfiguration zurücksetzen": "reset_config",
+            "🧪 Synthetische Daten zurücksetzen": "reset_synth",
+            "📦 Batch Prediction zurücksetzen": "reset_batch",
+        }
+
+        with gr.Column():
+            gr.Markdown("### Aktionen-Menü")
+            with gr.Row(equal_height=True):
+                menu_action = gr.Dropdown(
+                    choices=list(menu_action_map.keys()),
+                    label="Aktion",
+                    value=None,
+                    interactive=True,
+                )
+                menu_button = gr.Button("Ausführen", variant="secondary")
+                menu_status = gr.Textbox(label="Menü-Status", interactive=False)
+            menu_download = gr.File(label="Menü-Download", interactive=False)
 
         with gr.Tabs():
             with gr.Tab("Training & Analyse"):
@@ -2280,8 +2556,8 @@ def build_interface() -> gr.Blocks:
                     file_input = gr.File(label="Excel-Dateien", file_types=[".xlsx", ".xls"], file_count="multiple")  # type: ignore[arg-type]
                     folder_input = gr.Textbox(label="Ordner (optional)", placeholder="Pfad zu einem Ordner mit Excel-Dateien")
                     config_input = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
-                    sheet_input = gr.Textbox(value="0", label="Sheet (Index oder Name)")
-                    target_input = gr.Textbox(value=DEFAULT_CONFIG.data.target_col or "", label="Zielspalte (optional)")
+                    sheet_input = gr.Textbox(value=sheet_default, label="Sheet (Index oder Name)")
+                    target_input = gr.Textbox(value=target_default, label="Zielspalte (optional)")
                     load_btn = gr.Button("Daten laden")
 
                 load_status = gr.Textbox(label="Status", interactive=False)
@@ -2467,6 +2743,206 @@ def build_interface() -> gr.Blocks:
                 batch_button = gr.Button("Belege prüfen")
                 batch_status = gr.Textbox(label="Batch-Status", interactive=False)
                 batch_download = gr.File(label="Batch Download", interactive=False)
+
+        menu_output_pairs = [
+            ("menu_status", menu_status),
+            ("menu_download", menu_download),
+            ("state", state),
+            ("file_input", file_input),
+            ("folder_input", folder_input),
+            ("config_input", config_input),
+            ("sheet_input", sheet_input),
+            ("target_input", target_input),
+            ("load_status", load_status),
+            ("data_preview", data_preview),
+            ("schema_json", schema_json),
+            ("build_status", build_status),
+            ("plan_json", plan_json),
+            ("prep_download", prep_download),
+            ("preview_status", preview_status),
+            ("preview_table", preview_table),
+            ("baseline_status", baseline_status),
+            ("metrics_json", metrics_json),
+            ("confusion_df", confusion_df),
+            ("model_download", model_download),
+            ("metrics_download", metrics_download),
+            ("importance_table", importance_table),
+            ("importance_plot", importance_plot),
+            ("importance_download", importance_download),
+            ("predictions_table", predictions_table),
+            ("predictions_download", predictions_download),
+            ("explain_index", explain_index),
+            ("explain_status", explain_status),
+            ("explain_json", explain_json),
+            ("explain_download", explain_download),
+            ("report_status", report_status),
+            ("report_preview", report_preview),
+            ("report_download", report_download),
+            ("pattern_status", pattern_status),
+            ("pattern_preview", pattern_preview),
+            ("pattern_download", pattern_download),
+            ("feedback_user", feedback_user),
+            ("feedback_comment", feedback_comment),
+            ("feedback_index", feedback_index),
+            ("feedback_status", feedback_status),
+            ("feedback_report_status", feedback_report_status),
+            ("feedback_report_preview", feedback_report_preview),
+            ("feedback_report_download", feedback_report_download),
+            ("config_info", config_info),
+            ("column_status", column_status),
+            ("column_selector", column_selector),
+            ("balance_checkbox", balance_checkbox),
+            ("synth_base", synth_base),
+            ("synth_config", synth_config),
+            ("synth_business_rules", synth_business_rules),
+            ("synth_profile", synth_profile),
+            ("synth_business_rules_text", synth_business_rules_text),
+            ("synth_profile_text", synth_profile_text),
+            ("synth_gpt_enable", synth_gpt_enable),
+            ("synth_gpt_model", synth_gpt_model),
+            ("synth_gpt_key", synth_gpt_key),
+            ("synth_bias_prompt", synth_bias_prompt),
+            ("synth_bias_status", synth_bias_status),
+            ("synth_bias_yaml", synth_bias_yaml),
+            ("synth_variation", synth_variation),
+            ("synth_lines", synth_lines),
+            ("synth_ratio", synth_ratio),
+            ("synth_seed", synth_seed),
+            ("synth_debug", synth_debug),
+            ("synth_status", synth_status),
+            ("synth_preview", synth_preview),
+            ("synth_download", synth_download),
+            ("synth_quality", synth_quality),
+            ("synth_log", synth_log),
+            ("batch_file", batch_file),
+            ("batch_status", batch_status),
+            ("batch_download", batch_download),
+        ]
+        menu_output_names = [name for name, _ in menu_output_pairs]
+        menu_outputs = [component for _, component in menu_output_pairs]
+
+        training_reset_updates = {
+            "file_input": gr.update(value=None),
+            "folder_input": "",
+            "config_input": gr.update(value=None),
+            "sheet_input": sheet_default,
+            "target_input": target_default,
+            "load_status": "",
+            "data_preview": gr.update(value=None),
+            "schema_json": gr.update(value=None),
+            "build_status": "",
+            "plan_json": gr.update(value=None),
+            "prep_download": gr.update(value=None),
+            "preview_status": "",
+            "preview_table": gr.update(value=None),
+            "baseline_status": "",
+            "metrics_json": gr.update(value=None),
+            "confusion_df": gr.update(value=None),
+            "model_download": gr.update(value=None),
+            "metrics_download": gr.update(value=None),
+            "importance_table": gr.update(value=None),
+            "importance_plot": gr.update(value=None),
+            "importance_download": gr.update(value=None),
+            "predictions_table": gr.update(value=None),
+            "predictions_download": gr.update(value=None),
+            "explain_index": 0,
+            "explain_status": "",
+            "explain_json": gr.update(value=None),
+            "explain_download": gr.update(value=None),
+            "report_status": "",
+            "report_preview": gr.update(value=""),
+            "report_download": gr.update(value=None),
+            "pattern_status": "",
+            "pattern_preview": gr.update(value=""),
+            "pattern_download": gr.update(value=None),
+            "column_status": "",
+            "feedback_user": "",
+            "feedback_comment": "",
+            "feedback_index": 0,
+            "feedback_status": "",
+            "feedback_report_status": "",
+            "feedback_report_preview": gr.update(value=""),
+            "feedback_report_download": gr.update(value=None),
+        }
+
+        synth_reset_updates = {
+            "synth_base": gr.update(value=None),
+            "synth_config": gr.update(value=None),
+            "synth_business_rules": gr.update(value=None),
+            "synth_profile": gr.update(value=None),
+            "synth_business_rules_text": default_business_rules_text,
+            "synth_profile_text": default_profile_text,
+            "synth_gpt_enable": True,
+            "synth_gpt_model": "gpt-5-mini",
+            "synth_gpt_key": "",
+            "synth_bias_prompt": "",
+            "synth_bias_status": "",
+            "synth_bias_yaml": "",
+            "synth_variation": 0.35,
+            "synth_lines": 100,
+            "synth_ratio": gr.update(value=None),
+            "synth_seed": 1234,
+            "synth_debug": False,
+            "synth_status": "",
+            "synth_preview": gr.update(value=None),
+            "synth_download": gr.update(value=None),
+            "synth_quality": gr.update(value=None),
+            "synth_log": "",
+        }
+
+        batch_reset_updates = {
+            "batch_file": gr.update(value=None),
+            "batch_status": "",
+            "batch_download": gr.update(value=None),
+        }
+
+        menu_defaults = {
+            "action_map": menu_action_map,
+            "output_names": menu_output_names,
+            "training_reset": training_reset_updates,
+            "synth_reset": synth_reset_updates,
+            "batch_reset": batch_reset_updates,
+        }
+
+        menu_button.click(
+            partial(
+                handle_menu_action,
+                defaults=menu_defaults,
+            ),
+            inputs=[
+                menu_action,
+                state,
+                file_input,
+                folder_input,
+                config_input,
+                sheet_input,
+                target_input,
+                explain_index,
+                feedback_user,
+                feedback_comment,
+                feedback_index,
+                column_selector,
+                balance_checkbox,
+                synth_base,
+                synth_config,
+                synth_business_rules,
+                synth_profile,
+                synth_business_rules_text,
+                synth_profile_text,
+                synth_gpt_enable,
+                synth_gpt_model,
+                synth_gpt_key,
+                synth_bias_prompt,
+                synth_bias_yaml,
+                synth_variation,
+                synth_lines,
+                synth_ratio,
+                synth_seed,
+                synth_debug,
+                batch_file,
+            ],
+            outputs=menu_outputs,
+        )
 
         load_btn.click(
             load_dataset,

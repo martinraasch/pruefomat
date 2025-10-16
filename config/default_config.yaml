@@ -9,11 +9,12 @@ data:
     - "Land"
     - "BUK"
     - "Debitor"
+    - "Ampel"
   text_columns:
     - "DEB_Name"
     - "Massnahme_2025"
     - "Hinweise"
-  target_col: "Ampel"
+  target_col: "Massnahme_2025"
   null_like:
     - ""
     - " "
@@ -23,6 +24,9 @@ data:
     - "na"
     - "nan"
     - "None"
+
+  flag_columns:
+    - "negativ"
 
 preprocessing:
   tfidf_max_features: 4000
