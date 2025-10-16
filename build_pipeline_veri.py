@@ -9,7 +9,7 @@ import unicodedata
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -204,6 +204,79 @@ class DaysUntilDueAdder(BaseEstimator, TransformerMixin):
         return df
 
 
+class HistoricalPatternFeatures(BaseEstimator, TransformerMixin):
+    """Aggregate historical Maßnahme patterns per BUK/Debitor combination."""
+
+    def __init__(self, group_cols: List[str] | None = None) -> None:
+        self.group_cols = group_cols or ["BUK", "Debitor"]
+
+    def fit(self, X, y=None):  # noqa: D401
+        df = pd.DataFrame(X).copy()
+        self.group_cols_ = [col for col in self.group_cols if col in df.columns]
+        self.most_frequent_: Dict[Tuple, str] = {}
+        self.action_counts_: Dict[Tuple, Dict[str, int]] = {}
+
+        if not self.group_cols_ or y is None:
+            return self
+
+        target_series = pd.Series(y)
+        df["_target"] = target_series.values
+
+        grouped_mode = (
+            df.groupby(self.group_cols_, dropna=False)["_target"]
+            .agg(lambda values: values.mode().iloc[0] if not values.mode().empty else None)
+        )
+        for key, value in grouped_mode.items():
+            self.most_frequent_[self._ensure_tuple(key)] = self._coerce_label(value)
+
+        count_frame = (
+            df.groupby(self.group_cols_ + ["_target"], dropna=False)
+            .size()
+            .reset_index(name="count")
+        )
+        for _, row in count_frame.iterrows():
+            key = self._ensure_tuple(tuple(row[col] for col in self.group_cols_))
+            label = self._coerce_label(row["_target"])
+            self.action_counts_.setdefault(key, {})[label] = int(row["count"])
+
+        return self
+
+    def transform(self, X):
+        df = pd.DataFrame(X).copy()
+        if not getattr(self, "group_cols_", None):
+            df["hist_most_frequent_action"] = "unknown"
+            df["hist_action_diversity"] = 0
+            df["hist_gutschrift_count"] = 0
+            return df
+
+        keys = df[self.group_cols_].apply(lambda row: self._ensure_tuple(tuple(row)), axis=1)
+
+        df["hist_most_frequent_action"] = keys.apply(
+            lambda key: self.most_frequent_.get(key, "unknown")
+        )
+        df["hist_action_diversity"] = keys.apply(
+            lambda key: len(self.action_counts_.get(key, {}))
+        )
+        df["hist_gutschrift_count"] = keys.apply(
+            lambda key: self.action_counts_.get(key, {}).get("Gutschrift", 0)
+        )
+        return df
+
+    @staticmethod
+    def _ensure_tuple(value: Tuple | Any) -> Tuple:
+        if isinstance(value, tuple):
+            return value
+        if isinstance(value, pd.Series):
+            return tuple(value.tolist())
+        return (value,)
+
+    @staticmethod
+    def _coerce_label(value: Any) -> str:
+        if pd.isna(value):
+            return "unknown"
+        return str(value)
+
+
 class SelectColumns(BaseEstimator, TransformerMixin):
     """Select a subset of columns, dropping missing ones gracefully."""
 
@@ -295,24 +368,36 @@ def infer_feature_plan(df: pd.DataFrame, config: AppConfig) -> FeaturePlan:
 
 def build_preprocessor(feature_plan: FeaturePlan, config: AppConfig) -> Pipeline:
     transformers: List[tuple] = []
+    historical_numeric = ["hist_action_diversity", "hist_gutschrift_count"]
+    historical_categorical = ["hist_most_frequent_action"]
 
-    if feature_plan.numeric:
+    augmented_numeric = list(feature_plan.numeric)
+    for col in historical_numeric:
+        if col not in augmented_numeric:
+            augmented_numeric.append(col)
+
+    augmented_categorical = list(feature_plan.categorical)
+    for col in historical_categorical:
+        if col not in augmented_categorical:
+            augmented_categorical.append(col)
+
+    if augmented_numeric:
         numeric_pipeline = Pipeline(
             steps=[
                 ("impute", SimpleImputer(strategy="median")),
                 ("scale", StandardScaler(with_mean=False)),
             ]
         )
-        transformers.append(("num", numeric_pipeline, feature_plan.numeric))
+        transformers.append(("num", numeric_pipeline, augmented_numeric))
 
-    if feature_plan.categorical:
+    if augmented_categorical:
         categorical_pipeline = Pipeline(
             steps=[
                 ("impute", SimpleImputer(strategy="most_frequent")),
                 ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
             ]
         )
-        transformers.append(("cat", categorical_pipeline, feature_plan.categorical))
+        transformers.append(("cat", categorical_pipeline, augmented_categorical))
 
     if feature_plan.text:
         text_pipeline = Pipeline(
@@ -341,6 +426,11 @@ def build_preprocessor(feature_plan: FeaturePlan, config: AppConfig) -> Pipeline
     date_columns = config.data.additional_date_columns
     null_like = list({*NULL_LIKE_DEFAULT, *config.data.null_like})
 
+    selected_columns = feature_plan.all
+    for col in (*historical_categorical, *historical_numeric):
+        if col not in selected_columns:
+            selected_columns.append(col)
+
     pipeline = Pipeline(
         steps=[
             (
@@ -360,7 +450,8 @@ def build_preprocessor(feature_plan: FeaturePlan, config: AppConfig) -> Pipeline
                     due_col=config.data.due_col or "",
                 ),
             ),
-            ("select", SelectColumns(feature_plan.all)),
+            ("historical", HistoricalPatternFeatures()),
+            ("select", SelectColumns(selected_columns)),
             ("encode", column_transformer),
         ]
     )
