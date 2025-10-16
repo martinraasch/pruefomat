@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from .business_rules import BusinessRule, RuleOperator, SimpleCondition
@@ -82,19 +83,34 @@ class RuleEngine:
 
         return False
 
+    @staticmethod
+    def _coerce_amount(value: object) -> Optional[float]:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return None
+        try:
+            if isinstance(value, str):
+                cleaned = value.strip().replace(".", "").replace(",", ".")
+                return float(cleaned)
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+
     def _check_simple_condition(self, condition: SimpleCondition, row: pd.Series) -> bool:
         field_value = row.get(condition.field)
 
-        if pd.isna(field_value):
+        if (field_value is None or pd.isna(field_value)) and condition.field == "Betrag_parsed":
+            field_value = self._coerce_amount(row.get("Betrag"))
+
+        if field_value is None or pd.isna(field_value):
             return False
 
         operator = condition.operator
         target_value = condition.value
 
         if operator == RuleOperator.EQUALS:
-            return bool(field_value == target_value)
+            return self._compare_equality(field_value, target_value)
         if operator == RuleOperator.NOT_EQUALS:
-            return bool(field_value != target_value)
+            return not self._compare_equality(field_value, target_value)
         if operator == RuleOperator.LESS_THAN:
             return self._compare_numeric(field_value, target_value, lambda a, b: a < b)
         if operator == RuleOperator.LESS_THAN_OR_EQUAL:
@@ -118,6 +134,24 @@ class RuleEngine:
         except (TypeError, ValueError):
             return False
         return comparer(left_val, right_val)
+
+    @staticmethod
+    def _compare_equality(left: object, right: object) -> bool:
+        if left is right:
+            return True
+
+        if pd.isna(left) or pd.isna(right):
+            return False
+
+        if left == right:
+            return True
+
+        try:
+            return float(left) == float(right)
+        except (TypeError, ValueError):
+            pass
+
+        return str(left).strip().lower() == str(right).strip().lower()
 
     @staticmethod
     def _in_collection(value: object, container: object, positive: bool) -> bool:

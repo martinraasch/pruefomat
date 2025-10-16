@@ -156,13 +156,14 @@ def test_negativ_filter_in_batch(tmp_path, monkeypatch):
     assert "Batch abgeschlossen" in status
     out_df = pd.read_excel(output_path)
 
-    negativ_rows = out_df[out_df["Debitor"] == "200"]
+    debitor_str = out_df["Debitor"].astype(str)
+    negativ_rows = out_df[debitor_str == "200"]
     assert len(negativ_rows) == 1
     negativ_row = negativ_rows.iloc[0]
     assert "Bereits abgelehnt" in negativ_row["Massnahme_2025"]
     assert pytest.approx(negativ_row["fraud_score"], rel=1e-6) == 100.0
     assert negativ_row["prediction_source"] == "negativ_flag"
 
-    normal_rows = out_df[out_df["Debitor"].isin(["100", "300"])]
+    normal_rows = out_df[debitor_str.isin(["100", "300"])]
     assert len(normal_rows) == 2
     assert all(normal_rows["prediction_source"] != "negativ_flag")

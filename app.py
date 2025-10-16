@@ -2212,7 +2212,7 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
                 n_filtered=n_negativ,
                 n_total=len(df_input),
             )
-            df_negativ = df_input.loc[negativ_mask].copy()
+            df_negativ = df_input_raw.loc[negativ_mask].copy()
             df_negativ["Massnahme_2025"] = "Bereits abgelehnt (negativ)"
             df_negativ["final_confidence"] = 1.0
             df_negativ["prediction_source"] = "negativ_flag"
@@ -2262,9 +2262,11 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
 
     df_input["final_confidence"] = pd.to_numeric(df_input["final_confidence"], errors="coerce").fillna(0.0)
     df_input["fraud_score"] = df_input["final_confidence"] * 100.0
+    df_input["final_prediction"] = df_input["Massnahme_2025"]
 
     if df_negativ is not None:
         df_negativ["fraud_score"] = 100.0
+        df_negativ["final_prediction"] = df_negativ["Massnahme_2025"]
         for column in df_input.columns:
             if column not in df_negativ.columns:
                 df_negativ[column] = np.nan

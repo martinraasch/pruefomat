@@ -105,18 +105,18 @@ class HybridMassnahmenPredictor:
                 chosen_class = str(classes[best_local])
                 chosen_conf = float(restricted.max())
                 self._logger.info(
-                    "hybrid_ml_restricted",
-                    ampelfarbe=row.get("Ampel"),
-                    allowed=list(allowed_set),
-                    chosen=chosen_class,
-                    confidence=chosen_conf,
+                    "hybrid_ml_restricted ampelfarbe=%s allowed=%s chosen=%s confidence=%.3f",
+                    row.get("Ampel"),
+                    list(allowed_set),
+                    chosen_class,
+                    chosen_conf,
                 )
                 return chosen_class, chosen_conf, True
             else:
                 self._logger.warning(
-                    "hybrid_ml_restriction_empty",
-                    ampelfarbe=row.get("Ampel"),
-                    allowed=list(allowed_set),
+                    "hybrid_ml_restriction_empty ampelfarbe=%s allowed=%s",
+                    row.get("Ampel"),
+                    list(allowed_set),
                 )
         best_idx = int(proba.argmax())
         return str(classes[best_idx]), float(proba[best_idx]), False
