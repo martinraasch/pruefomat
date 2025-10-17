@@ -28,6 +28,7 @@ data:
 
   flag_columns:
     - "negativ"
+    - "Ruckmeldung_erhalten"
 
 preprocessing:
   tfidf_max_features: 4000

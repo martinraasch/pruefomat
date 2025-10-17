@@ -112,7 +112,7 @@ DEFAULT_BUSINESS_RULES_PATH = DATA_SYNTH_ROOT / "configs" / "business_rules.yaml
 DEFAULT_PROFILE_PATH = DATA_SYNTH_ROOT / "configs" / "invoice_profile.yaml"
 MASSNAHMEN_RULES_PATH = Path("config/business_rules_massnahmen.yaml")
 
-AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
+AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "Ticketnummer", "2025"}
 
 CANONICAL_MASSNAHMEN = [
     "Rechnungsprüfung",

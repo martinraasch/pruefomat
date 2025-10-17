@@ -167,7 +167,7 @@ class HybridMassnahmenPredictor:
                 return None
             self._shap_explainer = shap.TreeExplainer(classifier, self.background_)
 
-        shap_values = self._shap_explainer.shap_values(dense)
+        shap_values = self._shap_explainer.shap_values(dense, check_additivity=False)
         if isinstance(shap_values, list):
             try:
                 proba = self.ml_model.predict_proba(sample)

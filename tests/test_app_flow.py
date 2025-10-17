@@ -28,7 +28,7 @@ def patch_shap(monkeypatch):
         def __init__(self, model, background=None):
             self.model = model
 
-        def shap_values(self, X):
+        def shap_values(self, X, **kwargs):
             arr = np.asarray(X)
             if arr.ndim == 1:
                 arr = arr[None, :]

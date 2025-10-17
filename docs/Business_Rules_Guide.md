@@ -68,6 +68,12 @@ graph TD
 - Das System prüft BUK + Debitor-Kombinationen. Ab zwei Gutschriften greift automatisch `Gutschriftsverfahren`.
 - Neue Kombinationen werden wie gewohnt über die Ampelfarbe behandelt; ML setzt die passende Maßnahme innerhalb der erlaubten Klassen.
 
+### Historische Erfolgsquoten (Machine Learning Feature)
+- Das System nutzt die Spalte `Ruckmeldung_erhalten` aus historischen Daten, um abzuleiten, wie häufig bestimmte BUK/Debitor-Kombinationen auf Maßnahmen reagieren.
+- Für jede Kombination werden Erfolgsquoten berechnet, die als zusätzliche numerische Features in das Modell einfließen.
+- Kombinationen ohne Historie erhalten den globalen Durchschnittswert, sodass neue Kunden neutral bewertet werden.
+- Hinweis: Die Kennzahlen basieren auf historischen Rückläufen und stellen aggregierte Erfahrungswerte dar – sie ersetzen keine individuelle Prüfung.
+
 ## Regeln anpassen
 
 - Konfigurationsdatei: `config/business_rules_massnahmen.yaml`

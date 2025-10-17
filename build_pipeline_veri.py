@@ -284,6 +284,182 @@ class HistoricalPatternFeatures(BaseEstimator, TransformerMixin):
         return str(value)
 
 
+class MassnahmenSuccessFeatures(BaseEstimator, TransformerMixin):
+    """Derive historical response rates for BUK/Debitor combinations."""
+
+    def __init__(
+        self,
+        buk_col: str = "BUK",
+        debitor_col: str = "Debitor",
+        response_col: str = "Ruckmeldung_erhalten",
+        ampel_col: str = "Ampel",
+        min_samples: int = 3,
+        default_success: float = 0.5,
+    ) -> None:
+        self.buk_col = buk_col
+        self.debitor_col = debitor_col
+        self.response_col = response_col
+        self.ampel_col = ampel_col
+        self.min_samples = int(min_samples)
+        self.default_success = float(default_success)
+
+    def fit(self, X, y=None):  # noqa: D401
+        df = pd.DataFrame(X).copy()
+
+        if self.response_col not in df.columns:
+            logger.warning("Rücklauf-Spalte nicht gefunden, verwende neutrale Success-Rates")
+            return self._set_defaults(global_rate=self.default_success)
+
+        success_flags = df[self.response_col].apply(self._to_success_flag)
+        if success_flags.isna().all():
+            logger.warning("Rücklauf-Spalte leer, verwende neutrale Success-Rates")
+            return self._set_defaults(global_rate=self.default_success)
+
+        df["_success_flag"] = success_flags.fillna(False).astype(float)
+
+        group_cols = [col for col in (self.buk_col, self.debitor_col) if col in df.columns]
+        if len(group_cols) < 2:
+            logger.warning("BUK/Debitor-Spalten nicht vollständig, verwende neutrale Success-Rates")
+            return self._set_defaults(global_rate=float(df["_success_flag"].mean()))
+
+        grouped = (
+            df.groupby(group_cols, dropna=False)["_success_flag"]
+            .agg(success_count="sum", total_count="count")
+            .reset_index()
+        )
+        grouped["success_rate"] = grouped["success_count"] / grouped["total_count"].clip(lower=1)
+
+        self.success_lookup_: Dict[Tuple[Any, Any], Dict[str, float]] = {}
+        below_threshold = 0
+        for _, row in grouped.iterrows():
+            key = self._ensure_tuple(row[group_cols])
+            total = float(row["total_count"])
+            if total < self.min_samples:
+                below_threshold += 1
+            self.success_lookup_[key] = {
+                "rate": float(row["success_rate"]),
+                "count": total,
+                "success": float(row["success_count"]),
+            }
+
+        global_success = float(df["_success_flag"].mean()) if len(df) else self.default_success
+        if not np.isfinite(global_success):
+            global_success = self.default_success
+
+        ampel_lookup: Dict[Any, float] = {}
+        if self.ampel_col in df.columns:
+            grouped_ampel = (
+                df.groupby(self.ampel_col, dropna=False)["_success_flag"].mean().fillna(global_success)
+            )
+            ampel_lookup = {key: float(val) for key, val in grouped_ampel.items()}
+        self.ampel_success_lookup_ = ampel_lookup
+
+        self.global_success_rate_ = global_success if np.isfinite(global_success) else self.default_success
+        self.success_counts_ = {key: meta["count"] for key, meta in self.success_lookup_.items()}
+        self.history_count_ = len(self.success_lookup_)
+        self.below_threshold_ = below_threshold
+
+        logger.info(
+            "Historische Success-Rates berechnet: %d unique BUK/Debitor-Kombinationen gefunden",
+            self.history_count_,
+        )
+        logger.info(
+            "Globale Durchschnitts-Success-Rate: %.1f%%",
+            self.global_success_rate_ * 100,
+        )
+        logger.info(
+            "Kombinationen mit <3 Datenpunkten: %d (verwenden globalen Durchschnitt)",
+            self.below_threshold_,
+        )
+
+        return self
+
+    def transform(self, X):  # noqa: D401
+        df = pd.DataFrame(X).copy()
+        rate_col = "massnahme_success_rate_buk_debitor"
+        overall_col = "overall_response_rate"
+        ampel_col = "massnahme_success_rate_ampel"
+
+        rates = []
+        overall_rates = []
+        ampel_rates = []
+
+        index = df.index
+        buk_series = df[self.buk_col] if self.buk_col in df.columns else pd.Series(pd.NA, index=index)
+        debitor_series = df[self.debitor_col] if self.debitor_col in df.columns else pd.Series(pd.NA, index=index)
+        ampel_series = df[self.ampel_col] if self.ampel_col in df.columns else pd.Series(pd.NA, index=index)
+
+        for idx in range(len(df)):
+            buk = buk_series.iloc[idx] if idx < len(buk_series) else pd.NA
+            debitor = debitor_series.iloc[idx] if idx < len(debitor_series) else pd.NA
+            key = self._ensure_tuple([buk, debitor]) if not (pd.isna(buk) and pd.isna(debitor)) else None
+
+            rate, used_global, count = self._lookup_rate(key)
+            rates.append(rate)
+            overall_rates.append(rate)
+
+            ampel_val = ampel_series.iloc[idx] if idx < len(ampel_series) else pd.NA
+            ampel_rate = self._lookup_ampel_rate(ampel_val)
+            ampel_rates.append(ampel_rate)
+
+            source = "globaler Durchschnitt, keine Historie" if used_global else f"aus {int(count)} historischen Fällen"
+            logger.debug(
+                "success_rate_lookup",
+                buk=buk,
+                debitor=debitor,
+                rate=float(rate),
+                source=source,
+            )
+
+        df[rate_col] = np.asarray(rates, dtype=float)
+        df[overall_col] = np.asarray(overall_rates, dtype=float)
+        df[ampel_col] = np.asarray(ampel_rates, dtype=float)
+        return df
+
+    def _lookup_rate(self, key: Optional[Tuple[Any, Any]]) -> Tuple[float, bool, float]:
+        if key is None or key not in getattr(self, "success_lookup_", {}):
+            return self.global_success_rate_, True, 0.0
+        meta = self.success_lookup_[key]
+        if meta["count"] < self.min_samples:
+            return self.global_success_rate_, True, meta["count"]
+        return meta["rate"], False, meta["count"]
+
+    def _lookup_ampel_rate(self, ampel_value: Any) -> float:
+        if pd.isna(ampel_value):
+            return self.global_success_rate_
+        return self.ampel_success_lookup_.get(ampel_value, self.global_success_rate_)
+
+    def _set_defaults(self, global_rate: float) -> "MassnahmenSuccessFeatures":
+        rate = self.default_success if not np.isfinite(global_rate) else float(global_rate)
+        self.global_success_rate_ = rate
+        self.success_lookup_ = {}
+        self.success_counts_ = {}
+        self.ampel_success_lookup_ = {}
+        self.history_count_ = 0
+        self.below_threshold_ = 0
+        return self
+
+    @staticmethod
+    def _ensure_tuple(values: Iterable[Any]) -> Tuple[Any, Any]:
+        seq = list(values)
+        if len(seq) == 1:
+            seq.append(None)
+        return tuple(seq[:2])
+
+    @staticmethod
+    def _to_success_flag(value: Any) -> Optional[bool]:
+        if pd.isna(value):
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (int, np.integer)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if not text:
+            return False
+        return text in {"x", "true", "1", "ja", "yes"}
+
+
 class SelectColumns(BaseEstimator, TransformerMixin):
     """Select a subset of columns, dropping missing ones gracefully."""
 
@@ -377,9 +553,17 @@ def build_preprocessor(feature_plan: FeaturePlan, config: AppConfig) -> Pipeline
     transformers: List[tuple] = []
     historical_numeric = ["hist_action_diversity", "hist_gutschrift_count"]
     historical_categorical = ["hist_most_frequent_action"]
+    success_numeric = [
+        "massnahme_success_rate_buk_debitor",
+        "overall_response_rate",
+        "massnahme_success_rate_ampel",
+    ]
 
     augmented_numeric = list(feature_plan.numeric)
     for col in historical_numeric:
+        if col not in augmented_numeric:
+            augmented_numeric.append(col)
+    for col in success_numeric:
         if col not in augmented_numeric:
             augmented_numeric.append(col)
 
@@ -437,6 +621,9 @@ def build_preprocessor(feature_plan: FeaturePlan, config: AppConfig) -> Pipeline
     for col in (*historical_categorical, *historical_numeric):
         if col not in selected_columns:
             selected_columns.append(col)
+    for col in success_numeric:
+        if col not in selected_columns:
+            selected_columns.append(col)
 
     pipeline = Pipeline(
         steps=[
@@ -458,6 +645,7 @@ def build_preprocessor(feature_plan: FeaturePlan, config: AppConfig) -> Pipeline
                 ),
             ),
             ("historical", HistoricalPatternFeatures()),
+            ("success", MassnahmenSuccessFeatures()),
             ("select", SelectColumns(selected_columns)),
             ("encode", column_transformer),
         ]
