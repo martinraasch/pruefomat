@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, Iterable, List, Literal, Optional
 
 import numpy as np
@@ -14,6 +15,15 @@ from .rule_engine import RuleEngine
 
 class HybridMassnahmenPredictor:
     """Predict Maßnahme values by combining deterministic rules with ML output."""
+
+    @staticmethod
+    def _normalise_class_name(name: object) -> str:
+        if name is None:
+            return ""
+        text = str(name).strip().lower()
+        text = re.sub(r"\s+", " ", text)
+        text = text.replace("( ", "(")
+        return text
 
     def __init__(
         self,
@@ -102,8 +112,15 @@ class HybridMassnahmenPredictor:
             return str(classes[0]), None, False
         if allowed_classes:
             allowed_set = {str(name) for name in allowed_classes}
-            class_to_index = {str(cls): idx for idx, cls in enumerate(classes)}
-            valid_indices = [class_to_index[name] for name in allowed_set if name in class_to_index]
+            allowed_normalized = {self._normalise_class_name(name): str(name) for name in allowed_set}
+            class_to_index = {
+                self._normalise_class_name(cls): idx for idx, cls in enumerate(classes)
+            }
+            valid_indices = [
+                class_to_index[norm]
+                for norm in allowed_normalized
+                if norm and norm in class_to_index
+            ]
             if valid_indices:
                 restricted = proba[valid_indices]
                 if restricted.sum() == 0:
@@ -123,9 +140,10 @@ class HybridMassnahmenPredictor:
                 return chosen_class, chosen_conf, True
             else:
                 self._logger.warning(
-                    "hybrid_ml_restriction_empty ampelfarbe=%s allowed=%s",
+                    "hybrid_ml_restriction_empty ampelfarbe=%s allowed=%s available_normalized=%s",
                     row.get("Ampel"),
                     list(allowed_set),
+                    list(class_to_index.keys()),
                 )
         best_idx = int(proba.argmax())
         return str(classes[best_idx]), float(proba[best_idx]), False

@@ -9,6 +9,7 @@ import shap
 from app import (
     DEFAULT_CONFIG,
     DEFAULT_CONFIG_PATH,
+    CANONICAL_MASSNAHMEN,
     FEEDBACK_DB_PATH,
     build_pipeline_action,
     batch_predict_action,
@@ -253,6 +254,22 @@ def test_batch_prediction_rule_columns_preserved(tmp_path, baseline_state):
     assert (match["final_prediction"] == "Rechnungsprüfung").all()
 
 
+def test_batch_predictions_are_canonical(tmp_path, baseline_state):
+    _, _, state = baseline_state
+    df = state["df_features"].copy()
+    df = pd.concat([df] * 20, ignore_index=True)
+    batch_file = tmp_path / "batch_canonical.xlsx"
+    df.to_excel(batch_file, index=False)
+    upload = SimpleNamespace(name=str(batch_file))
+
+    status, download_path = batch_predict_action(upload, state)
+    assert "Batch abgeschlossen" in status
+    out_df = pd.read_excel(download_path)
+
+    allowed = set(CANONICAL_MASSNAHMEN) | {"Unbekannt"}
+    assert set(out_df["final_prediction"].unique()).issubset(allowed)
+
+
 def test_historical_gutschrift_rule_triggers():
     data = {
         "Betrag": ["500,00", "750,00", "600,00", "900,00"],
@@ -307,3 +324,54 @@ def test_historical_gutschrift_rule_triggers():
     prediction = predictor.predict(new_invoice)
     assert prediction.loc[0, "prediction"] == "Gutschriftsverfahren"
     assert prediction.loc[0, "source"] == "historische_gutschrift_muster"
+
+
+def test_label_encoder_uses_canonical_massnahmen():
+    data = {
+        "Betrag": [
+            "1.000,00",
+            "2.500,00",
+            "1.200,00",
+            "3.000,00",
+            "4.100,00",
+            "900,00",
+        ],
+        "Ampel": [1, 2, 2, 3, 1, 3],
+        "BUK": ["A", "B", "C", "A", "B", "C"],
+        "Debitor": ["100", "101", "102", "103", "104", "105"],
+        "Hinweise": ["", "", "", "", "", ""],
+        "Massnahme_2025": [
+            "Rechnungsprüfung",
+            "telefonische rechnungsbestätigung(vorgelagert)",
+            "Gutschriftsverfahren",
+            "schriftliche Saldenbestätigung (nachgelagert)",
+            "nur zur Belegerfassung",
+            "Freigabe gemäß Kompetenzkatalog",
+        ],
+    }
+
+    df = pd.DataFrame(data)
+    features = df.drop(columns=["Massnahme_2025"])
+    target = df["Massnahme_2025"]
+
+    config = DEFAULT_CONFIG.model_copy(deep=True)
+    config.preprocessing.tfidf_min_df = 1
+
+    state = {
+        "config": config,
+        "config_path": str(DEFAULT_CONFIG_PATH),
+        "df_features": features.copy(),
+        "df_features_full": features.copy(),
+        "target": target.copy(),
+        "selected_columns": list(features.columns),
+    }
+
+    _, _, _, state = build_pipeline_action(state)
+    result = train_baseline_action(state)
+    updated_state = result[-1]
+
+    classes = updated_state.get("label_classes", [])
+    assert "telefonische Rechnungsbestätigung (vorgelagert)" in classes
+    assert "telefonische rechnungsbestätigung(vorgelagert)" not in classes
+    allowed = set(CANONICAL_MASSNAHMEN) | {"Unbekannt"}
+    assert set(classes).issubset(allowed)

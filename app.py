@@ -7,6 +7,7 @@ import os
 import sqlite3
 import tempfile
 import textwrap
+import unicodedata
 from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
@@ -112,6 +113,32 @@ DEFAULT_PROFILE_PATH = DATA_SYNTH_ROOT / "configs" / "invoice_profile.yaml"
 MASSNAHMEN_RULES_PATH = Path("config/business_rules_massnahmen.yaml")
 
 AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "negativ", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
+
+CANONICAL_MASSNAHMEN = [
+    "Rechnungsprüfung",
+    "Beibringung Liefer-/Leistungsnachweis (vorgelagert)",
+    "Beibringung Liefer-/Leistungsnachweis (nachgelagert)",
+    "Beibringung Auftrag/Bestellung/Vertrag (vorgelagert)",
+    "Beibringung Auftrag/Bestellung/Vertrag (nachgelagert)",
+    "telefonische Rechnungsbestätigung (vorgelagert)",
+    "telefonische Rechnungsbestätigung (nachgelagert)",
+    "telefonische Lieferbestätigung (vorgelagert)",
+    "telefonische Lieferbestätigung (nachgelagert)",
+    "schriftliche Saldenbestätigung (vorgelagert)",
+    "schriftliche Saldenbestätigung (nachgelagert)",
+    "telefonische Saldenbestätigung (nachgelagert)",
+    "schriftliche Rechnungsbestätigung beim DEB (vorgelagert)",
+    "schriftliche Rechnungsbestätigung beim DEB (nachgelagert)",
+    "Freigabe gemäß Kompetenzkatalog",
+    "nur zur Belegerfassung",
+    "Gutschriftsverfahren",
+]
+
+_MASSNAHME_CANONICAL_LOOKUP = {
+    re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii").lower()): name
+    for name in CANONICAL_MASSNAHMEN
+}
+_UNKNOWN_MASSNAHMEN_LOGGED: set[str] = set()
 
 COLUMN_CANONICAL_MAP = {
     "Manahme_2025": "Massnahme_2025",
@@ -267,6 +294,28 @@ def _canonicalize_column_name(name: Optional[str]) -> Optional[str]:
     if not name:
         return name
     return COLUMN_CANONICAL_MAP.get(name, name)
+
+
+def normalize_massnahme(value: Any) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()) or (not isinstance(value, str) and pd.isna(value)):
+        return "Unbekannt"
+
+    text = str(value).strip()
+
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    normalized_key = re.sub(r"[^a-z0-9]", "", ascii_text.lower())
+    match = _MASSNAHME_CANONICAL_LOOKUP.get(normalized_key)
+    if match:
+        return match
+
+    if text not in _UNKNOWN_MASSNAHMEN_LOGGED:
+        _UNKNOWN_MASSNAHMEN_LOGGED.add(text)
+        logger.warning("massnahme_unknown", value=text)
+    return "Unbekannt"
+
+
+def canonicalize_massnahmen(series: pd.Series) -> pd.Series:
+    return series.apply(normalize_massnahme)
 
 
 def _reset_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1937,7 +1986,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         return _baseline_empty_result("Keine Zielspalte verfuegbar.")
 
     target_series = pd.Series(target).reset_index(drop=True)
-    target_series = target_series.fillna("Unbekannt").astype(str)
+    target_series = target_series.apply(normalize_massnahme)
 
     config = _ensure_config(state)
     rf_kwargs = config.model.random_forest.model_dump(exclude_none=True)
@@ -2024,7 +2073,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
 
     proba = baseline.predict_proba(X_test)
     ml_confidence = proba.max(axis=1)
-    ml_prediction = pd.Series(y_pred, name="ml_prediction").reset_index(drop=True)
+    ml_prediction = canonicalize_massnahmen(pd.Series(y_pred, name="ml_prediction")).reset_index(drop=True)
     ml_confidence_series = pd.Series(ml_confidence, name="ml_confidence").reset_index(drop=True)
 
     business_rules: List[BusinessRule] = []
@@ -2077,7 +2126,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "rule_source": applied_rule,
             "rule_prediction": rule_prediction,
             "rule_confidence": rule_confidence,
-            "final_prediction": final_prediction,
+            "final_prediction": canonicalize_massnahmen(final_prediction),
             "final_confidence": final_confidence,
             "actual": y_test.reset_index(drop=True),
         }
@@ -2522,12 +2571,12 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
 
     if hybrid_predictor is not None:
         results = hybrid_predictor.predict(df_input.reset_index(drop=True))
-        df_input["Massnahme_2025"] = results["prediction"]
+        df_input["Massnahme_2025"] = canonicalize_massnahmen(results["prediction"])
         df_input["final_confidence"] = results["confidence"].astype(float, errors="ignore")
         df_input["prediction_source"] = results["source"]
     else:
         proba = model.predict_proba(df_input)
-        ml_prediction = model.predict(df_input)
+        ml_prediction = canonicalize_massnahmen(pd.Series(model.predict(df_input))).reset_index(drop=True)
         ml_confidence = proba.max(axis=1)
         df_input["Massnahme_2025"] = ml_prediction
         df_input["final_confidence"] = ml_confidence
@@ -2535,11 +2584,11 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
 
     df_input["final_confidence"] = pd.to_numeric(df_input["final_confidence"], errors="coerce").fillna(0.0)
     df_input["fraud_score"] = df_input["final_confidence"] * 100.0
-    df_input["final_prediction"] = df_input["Massnahme_2025"]
+    df_input["final_prediction"] = canonicalize_massnahmen(df_input["Massnahme_2025"])
 
     if df_negativ is not None:
         df_negativ["fraud_score"] = 100.0
-        df_negativ["final_prediction"] = df_negativ["Massnahme_2025"]
+        df_negativ["final_prediction"] = canonicalize_massnahmen(df_negativ["Massnahme_2025"])
         for column in df_input.columns:
             if column not in df_negativ.columns:
                 df_negativ[column] = np.nan

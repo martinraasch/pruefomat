@@ -226,18 +226,13 @@ def test_ml_allowed_classes_restriction():
         classes_ = np.array(
             [
                 "Rechnungsprüfung",
-                "Beibringung Liefer-/Leistungsnachweis (vorgelagert)",
-                "Beibringung Liefer-/Leistungsnachweis (nachgelagert)",
+                "telefonische rechnungsbestätigung (vorgelagert)",
                 "telefonische Lieferbestätigung (vorgelagert)",
             ]
         )
 
         def predict_proba(self, X):  # noqa: N802
-            proba = np.zeros(len(self.classes_), dtype=float)
-            proba[3] = 0.8
-            proba[1] = 0.15
-            proba[0] = 0.05
-            return np.array([proba])
+            return np.array([[0.05, 0.15, 0.8]])
 
         def predict(self, X):  # noqa: N802
             return np.array(["Rechnungsprüfung"] * len(X))
@@ -251,8 +246,7 @@ def test_ml_allowed_classes_restriction():
         action_value="ML_PREDICTION",
         confidence=None,
         ml_allowed_classes=[
-            "Beibringung Liefer-/Leistungsnachweis (vorgelagert)",
-            "Beibringung Liefer-/Leistungsnachweis (nachgelagert)",
+            "Telefonische Rechnungsbestätigung (Vorgelagert)",
             "Rechnungsprüfung",
         ],
     )
@@ -261,5 +255,5 @@ def test_ml_allowed_classes_restriction():
 
     result = predictor.predict(pd.DataFrame([{"Ampel": 2}]))
     chosen = result.loc[0, "prediction"]
-    assert chosen in rule.ml_allowed_classes
-    assert chosen != "telefonische Lieferbestätigung (vorgelagert)"
+    normalized = chosen.strip().lower()
+    assert normalized == "telefonische rechnungsbestätigung (vorgelagert)"
