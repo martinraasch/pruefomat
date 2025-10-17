@@ -55,7 +55,14 @@ def strip_lower(series: pd.Series) -> pd.Series:
     """Strip whitespace and lowercase string entries while keeping missing as NaN."""
     s = series.astype("string").str.strip()
     s = s.replace({"": pd.NA})
-    return s.str.lower()
+    lowered = s.str.lower()
+    # Convert pandas <NA> markers to numpy nan so downstream sklearn
+    # imputers operating on object arrays do not trip over ambiguous NA.
+    lowered = lowered.astype(object)
+    mask = pd.isna(lowered)
+    if mask.any():
+        lowered[mask] = np.nan
+    return lowered
 
 
 def normalize_column_name(name: str) -> str:

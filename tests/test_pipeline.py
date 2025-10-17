@@ -74,3 +74,32 @@ def test_preprocessor_produces_feature_matrix():
         arr = np.asarray(matrix)
     assert arr.shape[1] > 0
     assert np.isfinite(arr).all()
+
+
+def test_preprocessor_handles_pandas_na_values():
+    config = _make_config()
+    df = _sample_dataframe()
+
+    features_df = df.drop(columns=[config.data.target_col]).copy()
+    features_df.loc[0, "Land"] = pd.NA
+    features_df.loc[1, "DEB_Name"] = pd.NA
+    features_df.loc[2, "Hinweise"] = pd.NA
+
+    preparer = DataFramePreparer(
+        amount_col=config.data.amount_col,
+        issue_col=config.data.issue_col,
+        due_col=config.data.due_col,
+        date_columns=config.data.additional_date_columns,
+        null_like=list({"", " ", "-"}),
+    )
+    prepared = preparer.fit_transform(features_df)
+    enriched = DaysUntilDueAdder(
+        issue_col=config.data.issue_col,
+        due_col=config.data.due_col,
+    ).fit_transform(prepared)
+
+    feature_plan = infer_feature_plan(enriched, config)
+    preprocessor = build_preprocessor(feature_plan, config)
+
+    matrix = preprocessor.fit_transform(features_df)
+    assert matrix.shape[0] == len(df)
