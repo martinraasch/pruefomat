@@ -63,7 +63,8 @@ class HybridMassnahmenPredictor:
         """Provide per-row explanation for hybrid prediction."""
 
         prediction, confidence, source = self.rule_engine.evaluate(row)
-        allowed_classes = getattr(self.rule_engine, "current_allowed_classes", None)
+        allowed_classes_raw = getattr(self.rule_engine, "current_allowed_classes", None)
+        allowed_classes = [str(item) for item in allowed_classes_raw or []]
 
         explanation: Dict[str, Any] = {
             "prediction": prediction,
@@ -73,10 +74,18 @@ class HybridMassnahmenPredictor:
         }
 
         if prediction is None:
-            prediction, confidence, restricted = self._run_ml(row, allowed_classes=allowed_classes)
+            prediction, confidence, restricted = self._run_ml(
+                row,
+                allowed_classes=allowed_classes,
+            )
             explanation["prediction"] = prediction
             explanation["confidence"] = confidence
             explanation["source"] = "ml_restricted" if restricted else "ml"
+            explanation["details"]["ml_context"] = {
+                "rule": source,
+                "restricted": bool(restricted and allowed_classes),
+                "allowed_classes": allowed_classes,
+            }
             explanation["details"]["shap_top5"] = self._get_shap_explanation(row)
         elif source:
             explanation["details"]["matched_conditions"] = self._get_rule_conditions(source, row)

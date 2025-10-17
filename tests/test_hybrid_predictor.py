@@ -77,3 +77,39 @@ def test_hybrid_predictor_explain_ml_path():
     assert explanation["prediction"] == "Gutschrift"
     assert explanation["source"] == "ml"
     assert "shap_top5" in explanation["details"]
+
+
+def test_hybrid_predictor_explain_ml_restricted():
+    restricted_rule = BusinessRule(
+        name="restricted_ml",
+        priority=1,
+        condition_type="simple",
+        conditions=[SimpleCondition("Ampel", RuleOperator.EQUALS, 2)],
+        action_field="Massnahme_2025",
+        action_value="ML_PREDICTION",
+        confidence=None,
+        ml_allowed_classes=["Rechnungsprüfung"],
+    )
+    fallback_rule = BusinessRule(
+        name="ml_fallback",
+        priority=2,
+        condition_type="always",
+        conditions=[],
+        action_field="Massnahme_2025",
+        action_value="ML_PREDICTION",
+        confidence=None,
+    )
+    engine = RuleEngine([restricted_rule, fallback_rule])
+    model = DummyModel()
+    predictor = HybridMassnahmenPredictor(model, engine)
+    row = pd.Series({"Ampel": 2})
+
+    explanation = predictor.explain(row)
+
+    assert explanation["prediction"] == "Rechnungsprüfung"
+    assert explanation["source"] == "ml_restricted"
+    context = explanation["details"].get("ml_context")
+    assert context is not None
+    assert context["rule"] == "restricted_ml"
+    assert context["restricted"] is True
+    assert context["allowed_classes"] == ["Rechnungsprüfung"]

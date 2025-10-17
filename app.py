@@ -112,6 +112,10 @@ MASSNAHMEN_RULES_PATH = Path("config/business_rules_massnahmen.yaml")
 
 AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "negativ", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
 
+COLUMN_CANONICAL_MAP = {
+    "Manahme_2025": "Massnahme_2025",
+}
+
 FEEDBACK_DB_PATH = Path(json.loads(os.environ.get("PRUEFOMAT_SETTINGS", "{}")).get("feedback_db", "feedback.db"))
 
 
@@ -256,6 +260,12 @@ def _format_schema(df: pd.DataFrame) -> Dict[str, Any]:
             }
         )
     return {"rows": total_rows, "columns": len(df.columns), "fields": details}
+
+
+def _canonicalize_column_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return name
+    return COLUMN_CANONICAL_MAP.get(name, name)
 
 
 def _reset_pipeline_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1179,6 +1189,18 @@ def _balance_training_set(
 def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folder_text: str, state: Optional[Dict[str, Any]]):
     state = state or {}
 
+    def _empty_result(message: str) -> tuple[Any, ...]:
+        return (
+            message,
+            None,
+            None,
+            gr.update(value={}),
+            gr.update(value=[], choices=[]),
+            "",
+            gr.update(value=False),
+            state,
+        )
+
     print("=" * 80, flush=True)
     print("CALLBACK WURDE AUFGERUFEN!", flush=True)
     print(f"Received upload: {upload}", flush=True)
@@ -1196,14 +1218,14 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
     if not excel_paths:
         logger.warning("ui_no_file", folder=folder_text or None)
         warn = warnings_list[0] if warnings_list else "Bitte zuerst eine Excel-Datei oder einen Ordner auswählen."
-        return warn, None, None, state
+        return _empty_result(warn)
 
     config_path: Optional[str]
     if config_upload is not None:
         config_path_obj = _extract_upload_path(config_upload)
         if config_path_obj is None:
             logger.warning("ui_config_upload_missing")
-            return "Konfigurationsdatei nicht gefunden.", None, None, state
+            return _empty_result("Konfigurationsdatei nicht gefunden.")
         config_path = str(config_path_obj)
     else:
         config_path = state.get("config_path", str(DEFAULT_CONFIG_PATH))
@@ -1212,10 +1234,13 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
         config = _load_app_config(config_path)
     except ConfigError as exc:
         logger.error("ui_config_error", message=str(exc), config_path=config_path)
-        return f"Konfigurationsfehler: {exc}", None, None, state
+        return _empty_result(f"Konfigurationsfehler: {exc}")
+
+    config.data.target_col = _canonicalize_column_name(config.data.target_col)
 
     if target_text:
-        config.data.target_col = normalize_column_name(target_text)
+        normalised_target = normalize_column_name(target_text)
+        config.data.target_col = _canonicalize_column_name(normalised_target)
 
     logger.info(
         "ui_config_loaded",
@@ -1247,6 +1272,10 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
             continue
 
         df_norm, column_mapping = normalize_columns(df_raw)
+        for alias, canonical in COLUMN_CANONICAL_MAP.items():
+            if alias in df_norm.columns and canonical not in df_norm.columns:
+                df_norm = df_norm.rename(columns={alias: canonical})
+                column_mapping = {orig: (canonical if mapped == alias else mapped) for orig, mapped in column_mapping.items()}
         df_norm["source_file"] = path.name
         frames.append(df_norm)
         column_mappings[path.name] = column_mapping
@@ -1263,7 +1292,7 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
         first_error = errors[0] if errors else "Keine gültigen Excel-Dateien gefunden."
         if warnings_list:
             errors = warnings_list + errors
-        return first_error, None, None, state
+        return _empty_result(first_error)
 
     df_norm_all = pd.concat(frames, ignore_index=True, sort=False)
     if "source_file" in df_norm_all.columns:
@@ -1287,7 +1316,10 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
                 df_features = df_norm_all.loc[mask_mass].drop(columns=[target_norm])
                 target_msg = f"Zielspalte erkannt: {target_norm} (mehrklassig)"
                 logger.info("ui_target_detected", target=target_norm)
-                state["target_mapping"] = {str(val): str(val) for val in target_series.dropna().unique()}
+                unique_values = list(dict.fromkeys(target_series.dropna().astype(str)))
+                target_mapping = {str(val): idx for idx, val in enumerate(unique_values, start=1)}
+                if target_mapping:
+                    state["target_mapping"] = target_mapping
             else:
                 target_msg = f"Zielspalte '{target_norm}' enthält keine nutzbaren Werte."
                 df_features = df_norm_all.drop(columns=[target_norm])
@@ -1876,12 +1908,32 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     target = state.get("target")
     feature_plan: FeaturePlan | None = state.get("feature_plan")
 
+    def _baseline_empty_result(message: str) -> tuple[Any, ...]:
+        empty_update = gr.update(value=None)
+        empty_text = gr.update(value="")
+        return (
+            message,
+            empty_update,
+            empty_update,
+            empty_update,
+            empty_update,
+            empty_update,
+            empty_update,
+            empty_update,
+            empty_update,
+            empty_update,
+            empty_text,
+            empty_text,
+            empty_update,
+            state,
+        )
+
     if df_features is None or feature_plan is None:
         logger.warning("ui_baseline_without_pipeline")
-        return "Bitte zuerst Pipeline bauen.", None, None, None, None, state
+        return _baseline_empty_result("Bitte zuerst Pipeline bauen.")
     if target is None:
         logger.warning("ui_baseline_without_target")
-        return "Keine Zielspalte verfuegbar.", None, None, None, None, state
+        return _baseline_empty_result("Keine Zielspalte verfuegbar.")
 
     target_series = pd.Series(target).reset_index(drop=True)
     target_series = target_series.fillna("Unbekannt").astype(str)
@@ -2152,24 +2204,42 @@ def explain_massnahme_action(state: Optional[Dict[str, Any]], row_index):
     if idx < 0 or idx >= len(df_features):
         return f"Index muss zwischen 0 und {len(df_features) - 1} liegen.", None, None, state
 
-    row = df_features.iloc[idx]
+    row = df_features.iloc[idx].copy()
     explanation = hybrid_predictor.explain(row)
     prediction_label = explanation.get("prediction")
     source = explanation.get("source", "ml") or "ml"
     confidence = explanation.get("confidence")
     confidence_text = f"{confidence:.1%}" if isinstance(confidence, (int, float)) else "n/a"
 
-    if source == "ml":
-        shap_table = _format_shap_table(explanation.get("details", {}).get("shap_top5"))
-        formatted = textwrap.dedent(
-            f"""
-            ### ML-Prediction: {prediction_label}
-            **Confidence:** {confidence_text}
+    details = explanation.get("details", {})
+    is_ml_prediction = source.startswith("ml")
 
-            **Top SHAP-Features:**
-            {shap_table}
-            """
-        ).strip()
+    if is_ml_prediction:
+        shap_table = _format_shap_table(details.get("shap_top5"))
+        ml_context = details.get("ml_context", {})
+        restriction_block = ""
+        rule_name = ml_context.get("rule")
+        allowed = [str(item) for item in ml_context.get("allowed_classes", []) if item]
+        if rule_name and allowed:
+            verb = "beschränkt" if ml_context.get("restricted") else "definiert"
+            lines = [f"**Hinweis:** Regel `{rule_name}` {verb} die ML-Auswahl auf:"]
+            lines.extend(f"- {label}" for label in allowed)
+            restriction_block = "\n".join(lines)
+
+        parts = [
+            f"### ML-Prediction: {prediction_label}",
+            f"**Confidence:** {confidence_text}",
+        ]
+        if restriction_block:
+            parts.append(restriction_block)
+        parts.extend(
+            [
+                "",
+                "**Top SHAP-Features:**",
+                shap_table,
+            ]
+        )
+        formatted = "\n".join(parts).strip()
     else:
         conditions_markdown = _format_conditions(explanation.get("details", {}).get("matched_conditions"))
         formatted = textwrap.dedent(
@@ -2197,56 +2267,95 @@ def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
     feature_importance = state.get("feature_importance_df")
     vectorizer = state.get("notes_text_vectorizer")
 
+    def _report_empty_result(message: str) -> tuple[Any, ...]:
+        return message, gr.update(value=""), None, state
+
     if df_features is None or target is None or feature_importance is None:
-        return "Bitte zuerst Baseline trainieren.", None, state
+        return _report_empty_result("Bitte zuerst Baseline trainieren.")
 
-    target_series = pd.Series(target)
-    if target_series.nunique(dropna=True) > 2:
-        return "Pattern-Report derzeit nur für binäre Ziele verfügbar.", None, state
+    target_series = pd.Series(target).reset_index(drop=True)
+    df_local = df_features.reset_index(drop=True).copy()
+    min_len = min(len(df_local), len(target_series))
+    if min_len == 0:
+        return _report_empty_result("Keine Daten für den Pattern-Report vorhanden.")
 
-    report_lines = ["# Fraud Pattern Report", ""]
+    if len(df_local) != len(target_series):
+        df_local = df_local.iloc[:min_len].copy()
+        target_series = target_series.iloc[:min_len].copy()
+
+    target_label = state.get("target_name") or "Ziel"
+    internal_target_col = "__target_value__"
+    df_local[internal_target_col] = target_series
+    class_counts = target_series.value_counts(dropna=False)
+    n_classes = class_counts.shape[0]
+
+    def _format_cell(value: object) -> str:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return "(NaN)"
+        return str(value)
+
+    report_lines = [f"# Pattern Report für {target_label}", ""]
     top_features = feature_importance.head(10)
-    report_lines.append("## Top Risiko-Features")
+    report_lines.append("## Wichtigste Features")
     for _, row in top_features.iterrows():
         report_lines.append(f"- **{row['feature']}**: Importance {row['importance']:.4f}")
     report_lines.append("")
 
-    df_local = df_features.copy()
-    y = target_series.astype(int, errors="ignore")
-    if not np.issubdtype(y.dtype, np.number):
-        y = pd.Series(np.where(target_series == target_series.mode().iloc[0], 1, 0))
-    df_local["is_fraud"] = y
-
-    report_lines.append("## Fraud-Rate nach Land")
-    if "Land" in df_local.columns:
-        table_land = df_local.groupby("Land")["is_fraud"].mean().sort_values(ascending=False)
-        report_lines.append("| Land | Fraud-Rate |")
-        report_lines.append("| --- | --- |")
-        for land, rate in table_land.items():
-            report_lines.append(f"| {land} | {rate:.2%} |")
-    else:
-        report_lines.append("Keine Spalte 'Land' vorhanden.")
+    report_lines.append("## Klassenverteilung")
+    report_lines.append("| Klasse | Anteil | Anzahl |")
+    report_lines.append("| --- | --- | --- |")
+    total_count = float(len(target_series))
+    for klass, count in class_counts.items():
+        report_lines.append(
+            f"| {_format_cell(klass)} | {count / total_count:.2%} | {int(count)} |"
+        )
     report_lines.append("")
 
-    report_lines.append("## Fraud-Rate nach BUK")
-    if "BUK" in df_local.columns:
-        table_buk = df_local.groupby("BUK")["is_fraud"].mean().sort_values(ascending=False)
-        report_lines.append("| BUK | Fraud-Rate |")
-        report_lines.append("| --- | --- |")
-        for buk, rate in table_buk.items():
-            report_lines.append(f"| {buk} | {rate:.2%} |")
-    else:
-        report_lines.append("Keine Spalte 'BUK' vorhanden.")
-    report_lines.append("")
+    for column, label in (("Land", "Land"), ("BUK", "BUK")):
+        report_lines.append(f"## Verteilung nach {label}")
+        if column in df_local.columns:
+            group = (
+                df_local.groupby([column, internal_target_col])
+                .size()
+                .reset_index(name="count")
+            )
+            if not group.empty:
+                group["share"] = group["count"] / group.groupby(column)["count"].transform("sum")
+                top_rows = group.sort_values(["share", "count"], ascending=[False, False]).head(10)
+                report_lines.append(f"| {label} | {target_label} | Anteil | Anzahl |")
+                report_lines.append("| --- | --- | --- | --- |")
+                for _, row in top_rows.iterrows():
+                    report_lines.append(
+                        f"| {_format_cell(row[column])} | {_format_cell(row[internal_target_col])} | "
+                        f"{row['share']:.2%} | {int(row['count'])} |"
+                    )
+            else:
+                report_lines.append("Keine Daten verfügbar.")
+        else:
+            report_lines.append(f"Keine Spalte '{column}' vorhanden.")
+        report_lines.append("")
 
-    report_lines.append("## Betragsanalyse")
-    if "Betrag_parsed" in df_local.columns:
-        fraud_amount = df_local.loc[df_local["is_fraud"] == 1, "Betrag_parsed"].mean()
-        non_amount = df_local.loc[df_local["is_fraud"] == 0, "Betrag_parsed"].mean()
-        report_lines.append(f"- Durchschnittlicher Betrag (Fraud): {fraud_amount:.2f}")
-        report_lines.append(f"- Durchschnittlicher Betrag (Normal): {non_amount:.2f}")
+    report_lines.append("## Betrag je Klasse")
+    amount_column = "Betrag_parsed"
+    if amount_column in df_local.columns:
+        amount_series = pd.to_numeric(df_local[amount_column], errors="coerce")
     else:
-        report_lines.append("Betragsspalte nicht vorhanden.")
+        amount_series = pd.Series(dtype="float64")
+    if isinstance(amount_series, pd.Series) and amount_series.notna().any():
+        df_local["__amount_numeric__"] = amount_series
+        stats = (
+            df_local.groupby(internal_target_col)["__amount_numeric__"]
+            .agg(["mean", "median", "count"])
+            .reset_index()
+        )
+        report_lines.append("| Klasse | Mittelwert | Median | Anzahl |")
+        report_lines.append("| --- | --- | --- | --- |")
+        for _, row in stats.iterrows():
+            report_lines.append(
+                f"| {_format_cell(row[internal_target_col])} | {row['mean']:.2f} | {row['median']:.2f} | {int(row['count'])} |"
+            )
+    else:
+        report_lines.append("Betragsspalte nicht vorhanden oder ohne numerische Werte.")
     report_lines.append("")
 
     report_lines.append("## Text-Keywords")
@@ -2260,7 +2369,9 @@ def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
             feature_plan = state.get("feature_plan")
             candidate_cols: list[str] = []
             if feature_plan is not None:
-                candidate_cols.extend([col for col in getattr(feature_plan, "text", []) if col in df_features.columns])
+                candidate_cols.extend(
+                    [col for col in getattr(feature_plan, "text", []) if col in df_features.columns]
+                )
             if not candidate_cols:
                 config = _ensure_config(state)
                 candidate_cols.extend([col for col in config.data.text_columns if col in df_features.columns])
@@ -2269,22 +2380,31 @@ def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
                 text_source = df_features[candidate_cols].fillna("")
                 text_series = text_source.agg(" ".join, axis=1).astype(str)
 
-        if text_series is not None:
-            fraud_mask = y == 1
-            fraud_texts = text_series.loc[fraud_mask].fillna("")
+        if text_series is not None and not text_series.empty:
+            top_classes = class_counts.head(min(3, n_classes)).index
+            for klass in top_classes:
+                class_mask = target_series == klass
+                class_texts = text_series.loc[class_mask].fillna("")
+                if class_texts.empty:
+                    continue
+                transformed = vectorizer.transform(class_texts)
+                summed = np.asarray(transformed.sum(axis=0)).ravel()
+                if not np.any(summed):
+                    continue
+                top_idx = np.argsort(summed)[::-1][:10]
+                report_lines.append(f"### {_format_cell(klass)}")
+                for idx in top_idx:
+                    weight = summed[idx]
+                    if weight <= 0:
+                        continue
+                    report_lines.append(f"- {feature_names[idx]} (Gewicht {weight:.2f})")
+            if len(report_lines) > 0 and report_lines[-1] == "## Text-Keywords":
+                report_lines.append("Keine Textmuster gefunden.")
         else:
-            fraud_texts = pd.Series(dtype="string")
-
-        if not fraud_texts.empty:
-            transformed = vectorizer.transform(fraud_texts)
-            summed = np.asarray(transformed.sum(axis=0)).ravel()
-            top_idx = np.argsort(summed)[::-1][:10]
-            for idx in top_idx:
-                report_lines.append(f"- {feature_names[idx]} (Gewicht {summed[idx]:.2f})")
-        else:
-            report_lines.append("Keine Fraud-Texte vorhanden.")
+            report_lines.append("Keine Texte vorhanden.")
     else:
         report_lines.append("Text-Vektorisierer nicht verfügbar.")
+    report_lines.append("")
 
     markdown_text = "\n".join(report_lines)
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_report_"))
@@ -2467,7 +2587,8 @@ def feedback_report_action(state: Optional[Dict[str, Any]]):
         df = pd.read_sql_query("SELECT * FROM feedback", conn, parse_dates=["timestamp"]) if conn else pd.DataFrame()
 
     if df.empty:
-        return "Noch kein Feedback vorhanden.", "", None, state
+        empty_df = pd.DataFrame({"Feedback Report": []})
+        return "Noch kein Feedback vorhanden.", empty_df, None, state
 
     now = datetime.utcnow()
     last_week = now - timedelta(days=7)
@@ -2502,7 +2623,9 @@ def feedback_report_action(state: Optional[Dict[str, Any]]):
     md_path = tmp_dir / "feedback_report.md"
     md_path.write_text(md_text, encoding="utf-8")
 
-    return summary, md_text, str(md_path), state
+    preview_df = pd.DataFrame({"Feedback Report": report_lines})
+
+    return summary, preview_df, str(md_path), state
 
 
 def feedback_tp_action(state, row_index, user, comment):
@@ -2534,17 +2657,33 @@ def analyze_patterns_action(state: Optional[Dict[str, Any]]):
     if not generated:
         return "Keine interpretierbaren Merkmale generiert.", None, None, state
 
-    target_mapping = state.get("target_mapping") or {}
-    inverse_mapping = {int(v): str(k) for k, v in target_mapping.items()} if target_mapping else None
+    target_mapping_raw = state.get("target_mapping") or {}
+    target_series_raw = pd.Series(target).reset_index(drop=True)
+    target_strings = target_series_raw.astype("string").fillna("Unbekannt")
+    label_to_code: dict[str, int] = {}
+    for label, code in target_mapping_raw.items():
+        try:
+            label_to_code[str(label)] = int(code)
+        except (TypeError, ValueError):
+            continue
+    if not label_to_code:
+        unique_labels = list(dict.fromkeys(target_strings.tolist()))
+        label_to_code = {str(val): idx for idx, val in enumerate(unique_labels, start=1)}
+        state["target_mapping"] = label_to_code
+    if "Unbekannt" not in label_to_code:
+        label_to_code["Unbekannt"] = max(label_to_code.values(), default=0) + 1
+    target_encoded = target_strings.map(label_to_code).astype(int)
+    inverse_mapping = {code: label for label, code in label_to_code.items()}
 
     analyzer = ConditionalProbabilityAnalyzer(config)
-    insights = analyzer.analyze(generated, pd.Series(target).reset_index(drop=True), inverse_mapping)
+    insights = analyzer.analyze(generated, target_encoded, inverse_mapping)
     if not insights:
         return "Keine signifikanten Muster gefunden.", None, None, state
 
     formatter = InsightFormatter(target_name=target_name)
     lines = formatter.format_many(insights)
     markdown = "\n".join(f"- {line}" for line in lines)
+    state["pattern_summary_markdown"] = markdown
 
     df_rows = [
         {
@@ -2573,7 +2712,7 @@ def analyze_patterns_action(state: Optional[Dict[str, Any]]):
     state["pattern_insights_path"] = str(csv_path)
 
     status = f"{len(insights)} Muster gefunden."
-    return status, markdown, str(csv_path), state
+    return status, df_out, str(csv_path), state
 
 
 def handle_menu_action(
@@ -2802,202 +2941,212 @@ def build_interface() -> gr.Blocks:
                 menu_status = gr.Textbox(label="Menü-Status", interactive=False)
             menu_download = gr.File(label="Menü-Download", interactive=False)
 
-        with gr.Column():
-            gr.Markdown("## Training & Analyse")
-            with gr.Row():
-                file_input = gr.File(label="Excel-Dateien")
-                folder_input = gr.Textbox(label="Ordner (optional)", placeholder="Pfad zu einem Ordner mit Excel-Dateien")
-                config_input = gr.File(label="Config (optional)")
-                sheet_input = gr.Textbox(value=sheet_default, label="Sheet (Index oder Name)")
-                target_input = gr.Textbox(value=target_default, label="Zielspalte (optional)")
-                load_btn = gr.Button("Daten laden")
-
-            load_status = gr.Textbox(label="Status", interactive=False)
-            data_preview = gr.Dataframe(label="Daten (erste Zeilen)", interactive=False)
-            schema_json = gr.JSON(label="Schema / Mapping")
-
-            gr.Markdown("## Pipeline")
-            build_btn = gr.Button("Pipeline bauen")
-            build_status = gr.Textbox(label="Pipeline-Status", interactive=False)
-            plan_json = gr.JSON(label="Feature-Plan")
-            prep_download = gr.File(label="Preprocessor Download", interactive=False)
-
-            preview_btn = gr.Button("Features Vorschau")
-            preview_status = gr.Textbox(label="Preview-Status", interactive=False)
-            preview_table = gr.Dataframe(label="Transformierte Features", interactive=False)
-
-            gr.Markdown("## Baseline Modell")
-            baseline_btn = gr.Button("Baseline trainieren")
-            baseline_status = gr.Textbox(label="Training-Status", interactive=False)
-            metrics_json = gr.JSON(label="Metriken")
-            confusion_df = gr.Dataframe(label="Konfusionsmatrix", interactive=False)
-            model_download = gr.File(label="Baseline Modell", interactive=False)
-            metrics_download = gr.File(label="Metrics JSON", interactive=False)
-            importance_table = gr.Dataframe(label="Feature Importances", interactive=False)
-            importance_plot = gr.Image(label="Feature Importances Plot", interactive=False)
-            importance_download = gr.File(label="Feature Importances CSV", interactive=False)
-            predictions_table = gr.Dataframe(label="Predictions", interactive=False)
-            predictions_download = gr.File(label="Predictions CSV", interactive=False)
-
-            gr.Markdown("## Feedback")
-            with gr.Row():
-                feedback_index = gr.Number(label="Zeilenindex", value=0, precision=0)
-                feedback_user = gr.Textbox(label="Benutzer", value="analyst")
-                feedback_comment = gr.Textbox(label="Kommentar", placeholder="optional")
-            with gr.Row():
-                feedback_tp_btn = gr.Button("Maßnahme korrekt")
-                feedback_fp_btn = gr.Button("Maßnahme falsch")
-            feedback_status = gr.Textbox(label="Feedback-Status", interactive=False)
-            feedback_report_btn = gr.Button("Feedback-Report erzeugen")
-            feedback_report_status = gr.Textbox(label="Report-Status", interactive=False)
-            feedback_report_preview = gr.Dataframe(label="Feedback Report", interactive=False)
-            feedback_report_download = gr.File(label="Feedback Report Download", interactive=False)
-
-            gr.Markdown("## Musteranalyse")
-            pattern_btn = gr.Button("Auffällige Muster analysieren")
-            pattern_status = gr.Textbox(label="Muster-Status", interactive=False)
-            pattern_preview = gr.Dataframe(label="Auffällige Muster", interactive=False)
-            pattern_download = gr.File(label="Muster Download", interactive=False)
-            report_btn = gr.Button("Report generieren")
-            report_status = gr.Textbox(label="Report-Status", interactive=False)
-            report_preview = gr.Markdown(label="Report Vorschau")
-            report_download = gr.File(label="Report Download", interactive=False)
-
-        gr.Markdown("## Maßnahmen-Analyse")
-        with gr.Column():
-            with gr.Row():
-                rule_coverage_box = gr.Textbox(label="Rule Coverage", interactive=False)
-                ml_fallback_box = gr.Textbox(label="ML Fallback Rate", interactive=False)
-            massnahmen_distribution_plot = gr.BarPlot(
-                label="Verteilung vorhergesagter Maßnahmen",
-                x="Massnahme",
-                y="Anzahl",
-            )
-
-            gr.Markdown("### Einzel-Erklärung")
-            with gr.Row():
-                explain_index = gr.Number(label="Zeilenindex", value=0, precision=0)
-                explain_btn = gr.Button("Erklärung anzeigen")
-            explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
-            rule_explanation = gr.Markdown(label="Erklärung")
-            explain_download = gr.File(label="Erklärungs-Download", interactive=False)
-
-        gr.Markdown("## Konfiguration")
-        with gr.Column():
-            config_info = gr.JSON(label="Aktive Konfiguration", value={})
-            column_selector = gr.CheckboxGroup(label="Spalten für das Training", choices=[])
-            balance_checkbox = gr.Checkbox(label="Ampel-Klassenbalancierung (Oversampling)", value=False)
-            column_status = gr.Textbox(label="Konfigurations-Status", interactive=False)
-
-        gr.Markdown("## Synthetische Daten")
-        with gr.Column():
-            gr.HTML(_tooltip_label(
-                "Ausgangsdatei (Excel)",
-                "Referenzdaten (z. B. `Veri-Bsp.xlsx`). Struktur, Spalten & Wertebereich leiten daraus die Synthese ab."
-            ))
-            synth_base = gr.File(show_label=False)
-
-            gr.HTML(_tooltip_label(
-                "Config (optional)",
-                "Pipeline-Overrides für Spalten, Textfeatures etc. Leer lassen → Standard `configs/default.yaml` wird genutzt."
-            ))
-            synth_config = gr.File(show_label=False)
-
-            with gr.Row():
+        with gr.Tabs():
+            with gr.TabItem("Training & Analyse"):
                 with gr.Column():
-                    gr.HTML(_tooltip_label(
-                        "Business Rules (optional)",
-                        "Eigene Geschäftslogik (MwSt, Fixwerte). Alternativ unten im YAML-Editor anpassen."
-                    ))
-                    synth_business_rules = gr.File(show_label=False)
-                with gr.Column():
-                    gr.HTML(_tooltip_label(
-                        "Profil (optional)",
-                        "Vordefinierte Variation/Textpools. Leer lassen → `invoice_profile.yaml`. Änderungen über den YAML-Editor möglich."
-                    ))
-                    synth_profile = gr.File(show_label=False)
-            gr.HTML(_tooltip_label(
-                "Business Rules Override (YAML)",
-                "Vorbelegung aus `configs/business_rules.yaml`. Hier direkt anpassen statt Datei hochzuladen."
-            ))
-            synth_business_rules_text = gr.Code(
-                label="Business Rules (YAML)",
-                value=default_business_rules_text,
-                language="yaml",
-            )
-            gr.HTML(_tooltip_label(
-                "Profil Override (YAML)",
-                "Base-Profile (Lieferzeiten etc.). Leer lassen → Standardprofil."
-            ))
-            synth_profile_text = gr.Code(
-                label="Profil (YAML)",
-                value=default_profile_text,
-                language="yaml",
-            )
-            with gr.Row():
-                synth_gpt_enable = gr.Checkbox(label="GPT verwenden", value=True)
-                synth_gpt_model = gr.Textbox(label="GPT-Modell", value="gpt-5-mini")
-                synth_gpt_key = gr.Textbox(label="OpenAI API-Key", type="password")
-            gr.HTML(_tooltip_label(
-                "Bias-Prompt",
-                "Textbeschreibung geplanter Verzerrungen (z. B. höherer Fraud-Anteil an Wochenenden)."
-            ))
-            synth_bias_prompt = gr.Textbox(label="Bias-Prompt", placeholder="z. B. Erhöhe Fraud am Wochenende")
-            synth_bias_button = gr.Button("Bias-Regeln generieren")
-            synth_bias_status = gr.Textbox(label="Bias-Status", interactive=False)
-            synth_bias_yaml = gr.Textbox(
-                label="Bias-Regeln (YAML)",
-                placeholder="Hier erscheinen die generierten Bias-Regeln – optional editierbar",
-                lines=8,
-                value="",
-            )
-            gr.HTML(_tooltip_label(
-                "Variation",
-                "0 = minimale Mutationen (Original fast kopiert), 1 = starke Abweichungen (neue Texte/Beträge). Beispiel: 0.3 erzeugt leichte Textvarianten."
-            ))
-            synth_variation = gr.Slider(0.0, 1.0, value=0.35, step=0.05, show_label=False)
-            with gr.Row():
-                with gr.Column():
-                    gr.HTML(_tooltip_label(
-                        "Ziel-Zeilen (pro Sheet)",
-                        "Absolute Anzahl zusätzlicher Zeilen je Blatt. Überschreibt das Ratio. Beispiel: 250 → jeweils 250 synthetische Zeilen."
-                    ))
-                    synth_lines = gr.Number(value=100, precision=0, show_label=False)
-                with gr.Column():
-                    gr.HTML(_tooltip_label(
-                        "Ratio (optional)",
-                        "Relative Menge im Vergleich zur Vorlage (1.0 = gleich viele Zeilen). Wird ignoriert, wenn Ziel-Zeilen gesetzt sind."
-                    ))
-                    synth_ratio = gr.Number(value=None, show_label=False)
-                with gr.Column():
-                    gr.HTML(_tooltip_label(
-                        "Seed",
-                        "Deterministischer Zufalls-Seed. Gleiche Eingaben + Seed → reproduzierbare Ergebnisse."
-                    ))
-                    synth_seed = gr.Number(value=1234, precision=0, show_label=False)
+                    gr.Markdown("## Training & Analyse")
+                    with gr.Row():
+                        file_input = gr.File(label="Excel-Dateien", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+                        folder_input = gr.Textbox(label="Ordner (optional)", placeholder="Pfad zu einem Ordner mit Excel-Dateien")
+                        config_input = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                        sheet_input = gr.Textbox(value=sheet_default, label="Sheet (Index oder Name)")
+                        target_input = gr.Textbox(value=target_default, label="Zielspalte (optional)")
+                        load_btn = gr.Button("Daten laden")
 
-            gr.HTML(_tooltip_label(
-                "Debug-Logging aktivieren",
-                "Schreibt detaillierte Synthesizer-Logs (z. B. pro Tabelle). Hilfreich beim Debugging, erzeugt aber mehr Output."
-            ))
-            synth_debug = gr.Checkbox(show_label=False, value=False)
-            synth_bias_prompt.info = "Verwendet GPT, um Wahrscheinlichkeiten z. B. anhand von Wochentagen oder Betragsmustern anzupassen."
-            synth_gpt_model.info = "Welches OpenAI-Modell für Textplausibilisierung genutzt wird."
-            synth_gpt_key.info = "API-Key nur nötig, wenn GPT aktiv ist. Wird temporär gesetzt und nach dem Lauf wieder entfernt."
-            synth_debug.info = "Schreibt detaillierte Fortschrittslogs (z. B. pro Tabelle). Gut zum Troubleshooting, verlängert ggf. den Output."
-            synth_button = gr.Button("Synthetische Daten erzeugen")
-            synth_status = gr.Textbox(label="Generator-Status", interactive=False)
-            synth_preview = gr.Dataframe(label="Vorschau der synthetischen Daten", interactive=False)
-            synth_download = gr.File(label="Download Synthetic Workbook", interactive=False)
-            synth_quality = gr.File(label="Download Quality Report", interactive=False)
-            synth_log = gr.Textbox(label="Generator-Log", lines=12, interactive=False)
+                    load_status = gr.Textbox(label="Status", interactive=False)
+                    data_preview = gr.Dataframe(label="Daten (erste Zeilen)", interactive=False)
+                    with gr.Accordion("Schema / Mapping", open=False):
+                        schema_json = gr.JSON(label="Schema / Mapping")
 
-        gr.Markdown("## Batch Prediction")
-        with gr.Column():
-            batch_file = gr.File(label="Excel-Datei")
-            batch_button = gr.Button("Belege prüfen")
-            batch_status = gr.Textbox(label="Batch-Status", interactive=False)
-            batch_download = gr.File(label="Batch Download", interactive=False)
+                    gr.Markdown("## Pipeline")
+                    build_btn = gr.Button("Pipeline bauen")
+                    build_status = gr.Textbox(label="Pipeline-Status", interactive=False)
+                    with gr.Accordion("Feature-Plan", open=False):
+                        plan_json = gr.JSON(label="Feature-Plan")
+                        prep_download = gr.File(label="Preprocessor Download", interactive=False)
+
+                    preview_btn = gr.Button("Features Vorschau")
+                    preview_status = gr.Textbox(label="Preview-Status", interactive=False)
+                    with gr.Accordion("Transformierte Features", open=False):
+                        preview_table = gr.Dataframe(label="Transformierte Features", interactive=False)
+
+                    gr.Markdown("## Baseline Modell")
+                    baseline_btn = gr.Button("Baseline trainieren")
+                    baseline_status = gr.Textbox(label="Training-Status", interactive=False)
+                    with gr.Accordion("Metriken", open=False):
+                        metrics_json = gr.JSON(label="Metriken")
+                        metrics_download = gr.File(label="Metrics JSON", interactive=False)
+                    with gr.Accordion("Konfusionsmatrix", open=False):
+                        confusion_df = gr.Dataframe(label="Konfusionsmatrix", interactive=False)
+                    model_download = gr.File(label="Baseline Modell", interactive=False)
+                    with gr.Accordion("Feature Importances", open=False):
+                        importance_table = gr.Dataframe(label="Feature Importances", interactive=False)
+                        importance_plot = gr.Image(label="Feature Importances Plot", interactive=False)
+                        importance_download = gr.File(label="Feature Importances CSV", interactive=False)
+                    predictions_table = gr.Dataframe(label="Predictions", interactive=False)
+                    predictions_download = gr.File(label="Predictions CSV", interactive=False)
+
+                    gr.Markdown("## Feedback")
+                    with gr.Row():
+                        feedback_index = gr.Number(label="Zeilenindex", value=0, precision=0)
+                        feedback_user = gr.Textbox(label="Benutzer", value="analyst")
+                        feedback_comment = gr.Textbox(label="Kommentar", placeholder="optional")
+                    with gr.Row():
+                        feedback_tp_btn = gr.Button("Maßnahme korrekt")
+                        feedback_fp_btn = gr.Button("Maßnahme falsch")
+                    feedback_status = gr.Textbox(label="Feedback-Status", interactive=False)
+                    feedback_report_btn = gr.Button("Feedback-Report erzeugen")
+                    feedback_report_status = gr.Textbox(label="Report-Status", interactive=False)
+                    feedback_report_preview = gr.Dataframe(label="Feedback Report", interactive=False)
+                    feedback_report_download = gr.File(label="Feedback Report Download", interactive=False)
+
+                    gr.Markdown("## Musteranalyse")
+                    pattern_btn = gr.Button("Auffällige Muster analysieren")
+                    pattern_status = gr.Textbox(label="Muster-Status", interactive=False)
+                    pattern_preview = gr.Dataframe(label="Auffällige Muster", interactive=False)
+                    pattern_download = gr.File(label="Muster Download", interactive=False)
+                    report_btn = gr.Button("Report generieren")
+                    report_status = gr.Textbox(label="Report-Status", interactive=False)
+                    report_preview = gr.Markdown(label="Report Vorschau")
+                    report_download = gr.File(label="Report Download", interactive=False)
+
+                    gr.Markdown("## Maßnahmen-Analyse")
+                    with gr.Row():
+                        rule_coverage_box = gr.Textbox(label="Rule Coverage", interactive=False)
+                        ml_fallback_box = gr.Textbox(label="ML Fallback Rate", interactive=False)
+                    massnahmen_distribution_plot = gr.BarPlot(
+                        label="Verteilung vorhergesagter Maßnahmen",
+                        x="Massnahme",
+                        y="Anzahl",
+                    )
+
+                    gr.Markdown("### Einzel-Erklärung")
+                    with gr.Row():
+                        explain_index = gr.Number(label="Zeilenindex", value=0, precision=0)
+                        explain_btn = gr.Button("Erklärung anzeigen")
+                    explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
+                    rule_explanation = gr.Markdown(label="Erklärung")
+                    explain_download = gr.File(label="Erklärungs-Download", interactive=False)
+
+            with gr.TabItem("Konfiguration"):
+                with gr.Column():
+                    gr.Markdown("## Konfiguration")
+                    config_info = gr.JSON(label="Aktive Konfiguration", value={})
+                    column_selector = gr.CheckboxGroup(label="Spalten für das Training", choices=[])
+                    balance_checkbox = gr.Checkbox(label="Ampel-Klassenbalancierung (Oversampling)", value=False)
+                    column_status = gr.Textbox(label="Konfigurations-Status", interactive=False)
+
+            with gr.TabItem("Synthetische Daten"):
+                with gr.Column():
+                    gr.Markdown("## Synthetische Daten")
+                    gr.HTML(_tooltip_label(
+                        "Ausgangsdatei (Excel)",
+                        "Referenzdaten (z. B. `Veri-Bsp.xlsx`). Struktur, Spalten & Wertebereich leiten daraus die Synthese ab."
+                    ))
+                    synth_base = gr.File(show_label=False, file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+
+                    gr.HTML(_tooltip_label(
+                        "Config (optional)",
+                        "Pipeline-Overrides für Spalten, Textfeatures etc. Leer lassen → Standard `configs/default.yaml` wird genutzt."
+                    ))
+                    synth_config = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+
+                    with gr.Row():
+                        with gr.Column():
+                            gr.HTML(_tooltip_label(
+                                "Business Rules (optional)",
+                                "Eigene Geschäftslogik (MwSt, Fixwerte). Alternativ unten im YAML-Editor anpassen."
+                            ))
+                            synth_business_rules = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                        with gr.Column():
+                            gr.HTML(_tooltip_label(
+                                "Profil (optional)",
+                                "Vordefinierte Variation/Textpools. Leer lassen → `invoice_profile.yaml`. Änderungen über den YAML-Editor möglich."
+                            ))
+                            synth_profile = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                    gr.HTML(_tooltip_label(
+                        "Business Rules Override (YAML)",
+                        "Vorbelegung aus `configs/business_rules.yaml`. Hier direkt anpassen statt Datei hochzuladen."
+                    ))
+                    synth_business_rules_text = gr.Code(
+                        label="Business Rules (YAML)",
+                        value=default_business_rules_text,
+                        language="yaml",
+                    )
+                    gr.HTML(_tooltip_label(
+                        "Profil Override (YAML)",
+                        "Base-Profile (Lieferzeiten etc.). Leer lassen → Standardprofil."
+                    ))
+                    synth_profile_text = gr.Code(
+                        label="Profil (YAML)",
+                        value=default_profile_text,
+                        language="yaml",
+                    )
+                    with gr.Row():
+                        synth_gpt_enable = gr.Checkbox(label="GPT verwenden", value=True)
+                        synth_gpt_model = gr.Textbox(label="GPT-Modell", value="gpt-5-mini")
+                        synth_gpt_key = gr.Textbox(label="OpenAI API-Key", type="password")
+                    gr.HTML(_tooltip_label(
+                        "Bias-Prompt",
+                        "Textbeschreibung geplanter Verzerrungen (z. B. höherer Fraud-Anteil an Wochenenden)."
+                    ))
+                    synth_bias_prompt = gr.Textbox(label="Bias-Prompt", placeholder="z. B. Erhöhe Fraud am Wochenende")
+                    synth_bias_button = gr.Button("Bias-Regeln generieren")
+                    synth_bias_status = gr.Textbox(label="Bias-Status", interactive=False)
+                    synth_bias_yaml = gr.Textbox(
+                        label="Bias-Regeln (YAML)",
+                        placeholder="Hier erscheinen die generierten Bias-Regeln – optional editierbar",
+                        lines=8,
+                        value="",
+                    )
+                    gr.HTML(_tooltip_label(
+                        "Variation",
+                        "0 = minimale Mutationen (Original fast kopiert), 1 = starke Abweichungen (neue Texte/Beträge). Beispiel: 0.3 erzeugt leichte Textvarianten."
+                    ))
+                    synth_variation = gr.Slider(0.0, 1.0, value=0.35, step=0.05, show_label=False)
+                    with gr.Row():
+                        with gr.Column():
+                            gr.HTML(_tooltip_label(
+                                "Ziel-Zeilen (pro Sheet)",
+                                "Absolute Anzahl zusätzlicher Zeilen je Blatt. Überschreibt das Ratio. Beispiel: 250 → jeweils 250 synthetische Zeilen."
+                            ))
+                            synth_lines = gr.Number(value=100, precision=0, show_label=False)
+                        with gr.Column():
+                            gr.HTML(_tooltip_label(
+                                "Ratio (optional)",
+                                "Relative Menge im Vergleich zur Vorlage (1.0 = gleich viele Zeilen). Wird ignoriert, wenn Ziel-Zeilen gesetzt sind."
+                            ))
+                            synth_ratio = gr.Number(value=None, show_label=False)
+                        with gr.Column():
+                            gr.HTML(_tooltip_label(
+                                "Seed",
+                                "Deterministischer Zufalls-Seed. Gleiche Eingaben + Seed → reproduzierbare Ergebnisse."
+                            ))
+                            synth_seed = gr.Number(value=1234, precision=0, show_label=False)
+
+                    gr.HTML(_tooltip_label(
+                        "Debug-Logging aktivieren",
+                        "Schreibt detaillierte Synthesizer-Logs (z. B. pro Tabelle). Hilfreich beim Debugging, erzeugt aber mehr Output."
+                    ))
+                    synth_debug = gr.Checkbox(show_label=False, value=False)
+                    synth_bias_prompt.info = "Verwendet GPT, um Wahrscheinlichkeiten z. B. anhand von Wochentagen oder Betragsmustern anzupassen."
+                    synth_gpt_model.info = "Welches OpenAI-Modell für Textplausibilisierung genutzt wird."
+                    synth_gpt_key.info = "API-Key nur nötig, wenn GPT aktiv ist. Wird temporär gesetzt und nach dem Lauf wieder entfernt."
+                    synth_debug.info = "Schreibt detaillierte Fortschrittslogs (z. B. pro Tabelle). Gut zum Troubleshooting, verlängert ggf. den Output."
+                    synth_button = gr.Button("Synthetische Daten erzeugen")
+                    synth_status = gr.Textbox(label="Generator-Status", interactive=False)
+                    synth_preview = gr.Dataframe(label="Vorschau der synthetischen Daten", interactive=False)
+                    synth_download = gr.File(label="Download Synthetic Workbook", interactive=False)
+                    synth_quality = gr.File(label="Download Quality Report", interactive=False)
+                    synth_log = gr.Textbox(label="Generator-Log", lines=12, interactive=False)
+
+            with gr.TabItem("Batch Prediction"):
+                with gr.Column():
+                    gr.Markdown("## Batch Prediction")
+                    batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+                    batch_button = gr.Button("Belege prüfen")
+                    batch_status = gr.Textbox(label="Batch-Status", interactive=False)
+                    batch_download = gr.File(label="Batch Download", interactive=False)
 
         load_btn.click(
             load_dataset,

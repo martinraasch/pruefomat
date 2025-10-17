@@ -13,6 +13,7 @@ from app import (
     build_pipeline_action,
     batch_predict_action,
     explain_massnahme_action,
+    generate_pattern_report_action,
     feedback_fp_action,
     feedback_report_action,
     feedback_tp_action,
@@ -213,4 +214,14 @@ def test_feedback_flow(baseline_state, feedback_db):
     assert "gespeichert" in status_fp
     report_status, report_text, report_path, _ = feedback_report_action(state)
     assert isinstance(report_status, str)
+    assert Path(report_path).exists()
+
+
+def test_pattern_report_multiclass(baseline_state):
+    _, _, state = baseline_state
+    status, markdown, report_path, _ = generate_pattern_report_action(state)
+
+    assert "Report" in status
+    assert "Klassenverteilung" in markdown
+    assert "Pattern Report" in markdown
     assert Path(report_path).exists()
