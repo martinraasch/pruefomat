@@ -33,9 +33,7 @@ Das System kombiniert deterministische Regeln mit Machine-Learning. Die Regeln w
 
 ```mermaid
 graph TD
-    A[Neue Rechnung] --> B{negativ=True?}
-    B -->|Ja| Z[Bereits abgelehnt (negativ)]
-    B -->|Nein| C{Ampel?}
+    A[Neue Rechnung] --> C{Ampel?}
 
     C -->|Grün (1)| D{Betrag?}
     D -->|< 50k| E[Rechnungsprüfung]
@@ -52,9 +50,10 @@ graph TD
 
 ## Wichtige Hinweise
 
-### Negativ-Spalte
-- **Training:** wird als Feature genutzt.
-- **Prediction:** Datensätze mit `negativ=True` werden gefiltert und mit „Bereits abgelehnt (negativ)“ zurückgegeben (Score = 100 %, Quelle = `negativ_flag`).
+### Negativ-Spalte als Feature
+- Die Spalte `negativ` (Wert "x" = Forderung wurde historisch nicht angekauft) wird als Feature in Training und Prediction genutzt.
+- Das Modell lernt daraus Muster, die zu detaillierten Prüfungen führten; es erfolgt kein Pre-Filter mehr.
+- Bei Batch-Prediction wird die Spalte wie jedes andere Merkmal behandelt (leer = keine historische Ablehnung).
 
 ### Betragsgrenzen
 - Bei **grüner Ampel** entscheidet der Betrag: `< 50.000 €` → Rechnungsprüfung, `≥ 50.000 €` → Freigabe gemäß Kompetenzkatalog.

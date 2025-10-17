@@ -112,7 +112,7 @@ DEFAULT_BUSINESS_RULES_PATH = DATA_SYNTH_ROOT / "configs" / "business_rules.yaml
 DEFAULT_PROFILE_PATH = DATA_SYNTH_ROOT / "configs" / "invoice_profile.yaml"
 MASSNAHMEN_RULES_PATH = Path("config/business_rules_massnahmen.yaml")
 
-AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "negativ", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
+AUTO_EXCLUDE_FEATURES = {"Manahme", "source_file", "Ruckmeldung_erhalten", "Ticketnummer", "2025"}
 
 CANONICAL_MASSNAHMEN = [
     "Rechnungsprüfung",
@@ -2118,6 +2118,8 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
                 except (TypeError, ValueError):
                     pass
 
+    final_prediction = canonicalize_massnahmen(final_prediction)
+
     predictions_df = pd.DataFrame(
         {
             "row_index": np.arange(len(final_prediction)),
@@ -2126,7 +2128,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "rule_source": applied_rule,
             "rule_prediction": rule_prediction,
             "rule_confidence": rule_confidence,
-            "final_prediction": canonicalize_massnahmen(final_prediction),
+            "final_prediction": final_prediction,
             "final_confidence": final_confidence,
             "actual": y_test.reset_index(drop=True),
         }
@@ -2488,27 +2490,6 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     df_input, _ = normalize_columns(df_input_raw)
     rule_context = df_input.copy()
 
-    df_negativ = None
-    if "negativ" in df_input.columns:
-        negativ_mask = df_input["negativ"].fillna(False).astype(bool)
-        n_negativ = int(negativ_mask.sum())
-        if n_negativ > 0:
-            logger.info(
-                "batch_prediction_filtered_negativ",
-                n_filtered=n_negativ,
-                n_total=len(df_input),
-            )
-            df_negativ = df_input_raw.loc[negativ_mask].copy()
-            df_negativ["Massnahme_2025"] = "Bereits abgelehnt (negativ)"
-            df_negativ["final_confidence"] = 1.0
-            df_negativ["prediction_source"] = "negativ_flag"
-            df_input = df_input.loc[~negativ_mask].copy()
-            rule_context = rule_context.loc[~negativ_mask].copy()
-        else:
-            df_negativ = None
-        df_input = df_input.drop(columns=["negativ"])
-    else:
-        df_negativ = None
 
     config = _ensure_config(state)
     target_col = config.data.target_col
@@ -2552,7 +2533,8 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
         if column in rule_lookup.columns:
             df_augmented[column] = rule_lookup[column]
         else:
-            df_augmented[column] = np.nan
+            fill_value = False if column == "negativ" else np.nan
+            df_augmented[column] = pd.Series(fill_value, index=df_augmented.index)
 
     df_input = df_augmented
 
@@ -2571,31 +2553,23 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
 
     if hybrid_predictor is not None:
         results = hybrid_predictor.predict(df_input.reset_index(drop=True))
-        df_input["Massnahme_2025"] = canonicalize_massnahmen(results["prediction"])
+        df_input["Massnahme_2025"] = canonicalize_massnahmen(results["prediction"]).to_numpy()
         df_input["final_confidence"] = results["confidence"].astype(float, errors="ignore")
         df_input["prediction_source"] = results["source"]
     else:
         proba = model.predict_proba(df_input)
-        ml_prediction = canonicalize_massnahmen(pd.Series(model.predict(df_input))).reset_index(drop=True)
+        raw_predictions = pd.Series(model.predict(df_input), index=df_input.index)
+        ml_prediction = canonicalize_massnahmen(raw_predictions).reset_index(drop=True)
         ml_confidence = proba.max(axis=1)
-        df_input["Massnahme_2025"] = ml_prediction
+        df_input["Massnahme_2025"] = ml_prediction.to_numpy()
         df_input["final_confidence"] = ml_confidence
         df_input["prediction_source"] = "ml"
 
     df_input["final_confidence"] = pd.to_numeric(df_input["final_confidence"], errors="coerce").fillna(0.0)
     df_input["fraud_score"] = df_input["final_confidence"] * 100.0
-    df_input["final_prediction"] = canonicalize_massnahmen(df_input["Massnahme_2025"])
+    df_input["final_prediction"] = canonicalize_massnahmen(df_input["Massnahme_2025"].astype("string")).to_numpy()
 
-    if df_negativ is not None:
-        df_negativ["fraud_score"] = 100.0
-        df_negativ["final_prediction"] = canonicalize_massnahmen(df_negativ["Massnahme_2025"])
-        for column in df_input.columns:
-            if column not in df_negativ.columns:
-                df_negativ[column] = np.nan
-        df_negativ = df_negativ[df_input.columns]
-        df_out = pd.concat([df_input, df_negativ], ignore_index=True)
-    else:
-        df_out = df_input
+    df_out = df_input
 
     progress(0.8, desc="Schreibe Ergebnis")
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_batch_"))
@@ -2606,14 +2580,10 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     logger.info(
         "ui_batch_prediction_completed",
         rows_predicted=len(df_input),
-        rows_negativ=len(df_negativ) if df_negativ is not None else 0,
         output=str(out_path),
     )
 
-    status = (
-        f"Batch abgeschlossen: {len(df_input)} Predictions,"
-        f" {len(df_negativ) if df_negativ is not None else 0} bereits abgelehnt"
-    )
+    status = f"Batch abgeschlossen: {len(df_input)} Predictions"
     return status, str(out_path)
 
 

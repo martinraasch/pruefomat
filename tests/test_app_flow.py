@@ -128,6 +128,18 @@ def baseline_state():
             "Telefonat ausstehend",
         ],
         "Ampel": [1, 2, 1, 3, 1, 2, 3, 1, 2, 3],
+        "negativ": [
+            False,
+            False,
+            True,
+            False,
+            False,
+            True,
+            False,
+            False,
+            False,
+            False,
+        ],
     }
     df = pd.DataFrame(data)
     df = df.rename(columns={"Maßnahme 2025": "Massnahme_2025"})
@@ -207,6 +219,13 @@ def test_batch_prediction(tmp_path, baseline_state):
     assert "final_confidence" in out_df.columns
 
 
+def test_negativ_feature_is_available(baseline_state):
+    _, _, state = baseline_state
+    feature_plan = state.get("feature_plan")
+    assert feature_plan is not None
+    assert "negativ" in feature_plan.categorical
+
+
 def test_feedback_flow(baseline_state, feedback_db):
     _, predictions, state = baseline_state
     status, state = feedback_tp_action(state, predictions.iloc[0]["row_index"], "alice", "korrekt")
@@ -268,6 +287,19 @@ def test_batch_predictions_are_canonical(tmp_path, baseline_state):
 
     allowed = set(CANONICAL_MASSNAHMEN) | {"Unbekannt"}
     assert set(out_df["final_prediction"].unique()).issubset(allowed)
+
+
+def test_batch_prediction_without_negativ_column(tmp_path, baseline_state):
+    _, _, state = baseline_state
+    df = state["df_features"].copy().drop(columns=["negativ"], errors="ignore")
+    batch_file = tmp_path / "batch_no_negativ.xlsx"
+    df.to_excel(batch_file, index=False)
+    upload = SimpleNamespace(name=str(batch_file))
+
+    status, download_path = batch_predict_action(upload, state)
+    assert "Batch abgeschlossen" in status
+    out_df = pd.read_excel(download_path)
+    assert len(out_df) == len(df)
 
 
 def test_historical_gutschrift_rule_triggers():

@@ -10,6 +10,7 @@ data:
     - "BUK"
     - "Debitor"
     - "Ampel"
+    - "negativ"
   text_columns:
     - "DEB_Name"
     - "Massnahme_2025"

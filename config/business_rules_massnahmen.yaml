@@ -1,6 +1,7 @@
 business_rules:
   version: "1.0"
   rules:
+    # Hinweis: Die Spalte "negativ" wird als ML-Feature verarbeitet und nicht über Regeln erzwungen.
     - name: "niedrig_betrag_gruene_ampel"
       priority: 1
       condition:
@@ -49,20 +50,6 @@ business_rules:
         value: "Gutschriftsverfahren"
       confidence: 0.9
       description: "Bei BUK+Debitor-Kombination mit ≥2 historischen Gutschriften"
-
-    - name: "negativ_rechnung"
-      priority: 4
-      condition:
-        type: "simple"
-        rules:
-          - field: "negativ"
-            operator: "equals"
-            value: true
-      action:
-        set_field: "Massnahme_2025"
-        value: "Ablehnung"
-      confidence: 1.0
-      description: "Negativ-Flag → keine Ankaufsentscheidung"
 
     - name: "gelbe_ampel_nachweise"
       priority: 10

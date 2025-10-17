@@ -114,7 +114,7 @@ def test_rule_vs_ml_conflict_resolution():
     assert result_fallback.loc[0, "prediction"] == "MLAction"
 
 
-def test_negativ_filter_in_batch(tmp_path, monkeypatch):
+def test_negativ_column_passed_to_batch_predictions(tmp_path, monkeypatch):
     class DummyProgress:
         def __call__(self, *args, **kwargs):
             return None
@@ -156,14 +156,6 @@ def test_negativ_filter_in_batch(tmp_path, monkeypatch):
     assert "Batch abgeschlossen" in status
     out_df = pd.read_excel(output_path)
 
-    debitor_str = out_df["Debitor"].astype(str)
-    negativ_rows = out_df[debitor_str == "200"]
-    assert len(negativ_rows) == 1
-    negativ_row = negativ_rows.iloc[0]
-    assert "Bereits abgelehnt" in negativ_row["Massnahme_2025"]
-    assert pytest.approx(negativ_row["fraud_score"], rel=1e-6) == 100.0
-    assert negativ_row["prediction_source"] == "negativ_flag"
-
-    normal_rows = out_df[debitor_str.isin(["100", "300"])]
-    assert len(normal_rows) == 2
-    assert all(normal_rows["prediction_source"] != "negativ_flag")
+    assert len(out_df) == len(df)
+    assert "negativ" in out_df.columns
+    assert all(out_df["prediction_source"] != "negativ_flag")
