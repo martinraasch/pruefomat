@@ -1179,6 +1179,11 @@ def _balance_training_set(
 def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folder_text: str, state: Optional[Dict[str, Any]]):
     state = state or {}
 
+    print("=" * 80, flush=True)
+    print("CALLBACK WURDE AUFGERUFEN!", flush=True)
+    print(f"Received upload: {upload}", flush=True)
+    print(f"Type: {type(upload)}", flush=True)
+    print("=" * 80, flush=True)
     print("DEBUG load_dataset invoked", flush=True)
     logger.debug(
         "ui_load_clicked",
@@ -2800,9 +2805,9 @@ def build_interface() -> gr.Blocks:
         with gr.Column():
             gr.Markdown("## Training & Analyse")
             with gr.Row():
-                file_input = gr.File(label="Excel-Dateien", file_types=[".xlsx", ".xls"], file_count="multiple")  # type: ignore[arg-type]
+                file_input = gr.File(label="Excel-Dateien")
                 folder_input = gr.Textbox(label="Ordner (optional)", placeholder="Pfad zu einem Ordner mit Excel-Dateien")
-                config_input = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                config_input = gr.File(label="Config (optional)")
                 sheet_input = gr.Textbox(value=sheet_default, label="Sheet (Index oder Name)")
                 target_input = gr.Textbox(value=target_default, label="Zielspalte (optional)")
                 load_btn = gr.Button("Daten laden")
@@ -2890,13 +2895,13 @@ def build_interface() -> gr.Blocks:
                 "Ausgangsdatei (Excel)",
                 "Referenzdaten (z. B. `Veri-Bsp.xlsx`). Struktur, Spalten & Wertebereich leiten daraus die Synthese ab."
             ))
-            synth_base = gr.File(show_label=False, file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+            synth_base = gr.File(show_label=False)
 
             gr.HTML(_tooltip_label(
                 "Config (optional)",
                 "Pipeline-Overrides für Spalten, Textfeatures etc. Leer lassen → Standard `configs/default.yaml` wird genutzt."
             ))
-            synth_config = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+            synth_config = gr.File(show_label=False)
 
             with gr.Row():
                 with gr.Column():
@@ -2904,13 +2909,13 @@ def build_interface() -> gr.Blocks:
                         "Business Rules (optional)",
                         "Eigene Geschäftslogik (MwSt, Fixwerte). Alternativ unten im YAML-Editor anpassen."
                     ))
-                    synth_business_rules = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                    synth_business_rules = gr.File(show_label=False)
                 with gr.Column():
                     gr.HTML(_tooltip_label(
                         "Profil (optional)",
                         "Vordefinierte Variation/Textpools. Leer lassen → `invoice_profile.yaml`. Änderungen über den YAML-Editor möglich."
                     ))
-                    synth_profile = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                    synth_profile = gr.File(show_label=False)
             gr.HTML(_tooltip_label(
                 "Business Rules Override (YAML)",
                 "Vorbelegung aus `configs/business_rules.yaml`. Hier direkt anpassen statt Datei hochzuladen."
@@ -2989,7 +2994,7 @@ def build_interface() -> gr.Blocks:
 
         gr.Markdown("## Batch Prediction")
         with gr.Column():
-            batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+            batch_file = gr.File(label="Excel-Datei")
             batch_button = gr.Button("Belege prüfen")
             batch_status = gr.Textbox(label="Batch-Status", interactive=False)
             batch_download = gr.File(label="Batch Download", interactive=False)
