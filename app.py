@@ -92,7 +92,7 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 os.environ.setdefault("GRADIO_DO_NOT_TRACK", "True")
 os.environ.setdefault("GRADIO_DISABLE_USAGE_STATS", "True")
 
-configure_logging()
+configure_logging(os.environ.get("PRUEFOMAT_LOG_LEVEL", "INFO"))
 logger = get_logger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -1017,6 +1017,91 @@ def _build_config_overview(state: Dict[str, Any]) -> Dict[str, Any]:
     return overview
 
 
+def _extract_upload_path(item) -> Optional[Path]:
+    """Return a filesystem path for a Gradio file-like upload.
+
+    Adds detailed debug logging so UI upload issues can be diagnosed from the
+    CLI logs.
+    """
+
+    if item is None:
+        logger.debug("upload_item_none")
+        return None
+
+    cached = getattr(item, "_resolved_path", None)
+    if cached:
+        cached_path = Path(cached)
+        if cached_path.exists():
+            logger.debug("upload_item_cached", path=str(cached_path))
+            return cached_path
+
+    if isinstance(item, (str, Path)):
+        path = Path(item)
+        logger.debug("upload_item_pathlike", path=str(path), exists=path.exists())
+        return path if path.exists() else None
+
+    logger.debug("upload_item_type", item_type=type(item).__name__)
+
+    candidate_attrs = (
+        "name",
+        "path",
+        "temp_file_path",
+        "tmp_path",
+        "temporary_file_path",
+    )
+
+    for attr in candidate_attrs:
+        value = getattr(item, attr, None)
+        logger.debug(
+            "upload_item_attr",
+            attr=attr,
+            present=value is not None,
+            value=str(value) if isinstance(value, str) else None,
+        )
+        if isinstance(value, str):
+            path = Path(value)
+            if path.exists():
+                logger.debug("upload_path_resolved", attr=attr, path=str(path))
+                try:
+                    setattr(item, "_resolved_path", str(path))
+                except Exception:  # pragma: no cover - cache best-effort
+                    pass
+                return path
+
+    # Gradio >=4 exposes `data` (bytes) + `orig_name` when running without a temp file.
+    data = getattr(item, "data", None)
+    if isinstance(data, bytes):
+        suffix = (
+            Path(getattr(item, "orig_name", "")).suffix
+            or Path(getattr(item, "name", "")).suffix
+            or ".xlsx"
+        )
+        logger.debug(
+            "upload_item_bytes",
+            orig_name=getattr(item, "orig_name", None),
+            name=getattr(item, "name", None),
+            size=len(data),
+            suffix=suffix,
+        )
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.write(data)
+            tmp.flush()
+            tmp.close()
+            logger.debug("upload_tempfile_created", path=tmp.name)
+            try:
+                setattr(item, "_resolved_path", tmp.name)
+            except Exception:  # pragma: no cover - cache best-effort
+                pass
+            return Path(tmp.name)
+        except Exception as exc:  # pragma: no cover - defensive fallback creation
+            logger.error("upload_tempfile_failed", message=str(exc))
+            return None
+
+    logger.debug("upload_item_unresolved", item_repr=repr(item))
+    return None
+
+
 def _collect_excel_files(upload, folder_text: str | None) -> tuple[list[Path], list[str]]:
     paths: list[Path] = []
     warnings_list: list[str] = []
@@ -1024,12 +1109,16 @@ def _collect_excel_files(upload, folder_text: str | None) -> tuple[list[Path], l
     if upload is not None:
         uploads = upload if isinstance(upload, list) else [upload]
         for item in uploads:
-            try:
-                path = Path(item.name)
-            except AttributeError:  # pragma: no cover - defensive
-                continue
-            if not path.exists():
-                warnings_list.append(f"Datei nicht gefunden: {path}")
+            logger.debug(
+                "ui_upload_inspect",
+                item_type=type(item).__name__,
+                has_name=hasattr(item, "name"),
+                has_path=hasattr(item, "path"),
+            )
+            path = _extract_upload_path(item)
+            if path is None or not path.exists():
+                display_name = getattr(item, "orig_name", None) or getattr(item, "name", "unbekannt")
+                warnings_list.append(f"Datei nicht gefunden: {display_name}")
                 continue
             if path.suffix.lower() not in {".xlsx", ".xls"}:
                 warnings_list.append(f"Überspringe nicht unterstützte Datei: {path.name}")
@@ -1090,6 +1179,14 @@ def _balance_training_set(
 def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folder_text: str, state: Optional[Dict[str, Any]]):
     state = state or {}
 
+    print("DEBUG load_dataset invoked", flush=True)
+    logger.debug(
+        "ui_load_clicked",
+        upload_type=type(upload).__name__ if upload is not None else None,
+        folder=folder_text,
+        config_upload_type=type(config_upload).__name__ if config_upload is not None else None,
+    )
+
     excel_paths, warnings_list = _collect_excel_files(upload, folder_text)
     if not excel_paths:
         logger.warning("ui_no_file", folder=folder_text or None)
@@ -1098,7 +1195,11 @@ def load_dataset(upload, config_upload, sheet_text: str, target_text: str, folde
 
     config_path: Optional[str]
     if config_upload is not None:
-        config_path = config_upload.name
+        config_path_obj = _extract_upload_path(config_upload)
+        if config_path_obj is None:
+            logger.warning("ui_config_upload_missing")
+            return "Konfigurationsdatei nicht gefunden.", None, None, state
+        config_path = str(config_path_obj)
     else:
         config_path = state.get("config_path", str(DEFAULT_CONFIG_PATH))
 
@@ -1434,7 +1535,8 @@ def generate_bias_rules_action(
     if not prompt_clean:
         return "Bitte zuerst einen Bias-Prompt eingeben.", existing_yaml, state
 
-    if base_file is None:
+    base_path = _extract_upload_path(base_file) if base_file is not None else None
+    if base_path is None:
         return "Bitte zuerst eine Ausgangsdatei hochladen.", existing_yaml, state
 
     if not gpt_enabled or not gpt_key:
@@ -1444,7 +1546,6 @@ def generate_bias_rules_action(
             state,
         )
 
-    base_path = Path(base_file.name)
     if not base_path.exists():
         return f"Ausgangsdatei nicht gefunden: {base_path}", existing_yaml, state
 
@@ -1542,10 +1643,10 @@ def generate_synthetic_data_action(
             "",
             state,
         )
-    if base_file is None:
+    base_path = _extract_upload_path(base_file) if base_file is not None else None
+    if base_path is None:
         return "Bitte eine Ausgangsdatei auswählen.", None, None, None, "", state
 
-    base_path = Path(base_file.name)
     if not base_path.exists():
         return "Ausgangsdatei nicht gefunden.", None, None, None, "", state
 
@@ -1574,7 +1675,7 @@ def generate_synthetic_data_action(
 
     config_path = None
     if config_file is not None:
-        config_path = Path(config_file.name)
+        config_path = _extract_upload_path(config_file)
     elif DEFAULT_SYNTH_CONFIG.exists():
         config_path = DEFAULT_SYNTH_CONFIG
 
@@ -1585,8 +1686,8 @@ def generate_synthetic_data_action(
     bias_rules_content = (bias_rules_input or "").strip()
     use_gpt = bool(gpt_enabled) and bool(gpt_key)
 
-    business_rules_path = Path(business_rules_file.name) if business_rules_file is not None else None
-    profile_path = Path(profile_file.name) if profile_file is not None else None
+    business_rules_path = _extract_upload_path(business_rules_file) if business_rules_file is not None else None
+    profile_path = _extract_upload_path(profile_file) if profile_file is not None else None
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_synth_"))
     output_path = tmp_dir / f"{base_path.stem}_synthetic.xlsx"
@@ -2194,12 +2295,13 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     if model is None:
         return "Bitte zuerst Baseline trainieren.", None
 
-    if upload is None:
+    upload_path = _extract_upload_path(upload) if upload is not None else None
+    if upload_path is None:
         return "Bitte eine Excel-Datei hochladen.", None
 
     progress = gr.Progress(track_tqdm=False)
     progress(0.05, desc="Lade Datei")
-    df_input_raw = pd.read_excel(upload.name)
+    df_input_raw = pd.read_excel(upload_path)
     df_input, _ = normalize_columns(df_input_raw)
 
     df_negativ = None
@@ -2695,423 +2797,202 @@ def build_interface() -> gr.Blocks:
                 menu_status = gr.Textbox(label="Menü-Status", interactive=False)
             menu_download = gr.File(label="Menü-Download", interactive=False)
 
-        with gr.Tabs():
-            with gr.Tab("Training & Analyse"):
-                with gr.Row():
-                    file_input = gr.File(label="Excel-Dateien", file_types=[".xlsx", ".xls"], file_count="multiple")  # type: ignore[arg-type]
-                    folder_input = gr.Textbox(label="Ordner (optional)", placeholder="Pfad zu einem Ordner mit Excel-Dateien")
-                    config_input = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
-                    sheet_input = gr.Textbox(value=sheet_default, label="Sheet (Index oder Name)")
-                    target_input = gr.Textbox(value=target_default, label="Zielspalte (optional)")
-                    load_btn = gr.Button("Daten laden")
+        with gr.Column():
+            gr.Markdown("## Training & Analyse")
+            with gr.Row():
+                file_input = gr.File(label="Excel-Dateien", file_types=[".xlsx", ".xls"], file_count="multiple")  # type: ignore[arg-type]
+                folder_input = gr.Textbox(label="Ordner (optional)", placeholder="Pfad zu einem Ordner mit Excel-Dateien")
+                config_input = gr.File(label="Config (optional)", file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                sheet_input = gr.Textbox(value=sheet_default, label="Sheet (Index oder Name)")
+                target_input = gr.Textbox(value=target_default, label="Zielspalte (optional)")
+                load_btn = gr.Button("Daten laden")
 
-                load_status = gr.Textbox(label="Status", interactive=False)
-                data_preview = gr.Dataframe(label="Daten (erste Zeilen)", interactive=False)
-                schema_json = gr.JSON(label="Schema / Mapping")
+            load_status = gr.Textbox(label="Status", interactive=False)
+            data_preview = gr.Dataframe(label="Daten (erste Zeilen)", interactive=False)
+            schema_json = gr.JSON(label="Schema / Mapping")
 
-                gr.Markdown("## Pipeline")
-                build_btn = gr.Button("Pipeline bauen")
-                build_status = gr.Textbox(label="Pipeline-Status", interactive=False)
-                plan_json = gr.JSON(label="Feature-Plan")
-                prep_download = gr.File(label="Preprocessor Download", interactive=False)
+            gr.Markdown("## Pipeline")
+            build_btn = gr.Button("Pipeline bauen")
+            build_status = gr.Textbox(label="Pipeline-Status", interactive=False)
+            plan_json = gr.JSON(label="Feature-Plan")
+            prep_download = gr.File(label="Preprocessor Download", interactive=False)
 
-                preview_btn = gr.Button("Features Vorschau")
-                preview_status = gr.Textbox(label="Preview-Status", interactive=False)
-                preview_table = gr.Dataframe(label="Transformierte Features", interactive=False)
+            preview_btn = gr.Button("Features Vorschau")
+            preview_status = gr.Textbox(label="Preview-Status", interactive=False)
+            preview_table = gr.Dataframe(label="Transformierte Features", interactive=False)
 
-                gr.Markdown("## Baseline Modell")
-                baseline_btn = gr.Button("Baseline trainieren")
-                baseline_status = gr.Textbox(label="Baseline-Status", interactive=False)
-                metrics_json = gr.JSON(label="Metriken")
-                confusion_df = gr.Dataframe(label="Confusion Matrix", interactive=False)
-                model_download = gr.File(label="Baseline Modell", interactive=False)
-                metrics_download = gr.File(label="Metrics JSON", interactive=False)
-                importance_table = gr.Dataframe(label="Feature Importanzen (Top 20)", interactive=False)
-                importance_plot = gr.Image(label="Feature Importance Chart", interactive=False)
-                importance_download = gr.File(label="Feature Importances CSV", interactive=False)
-                predictions_table = gr.Dataframe(label="Predictions (Test Set, sortiert nach Vertrauen)", interactive=False)
-                predictions_download = gr.File(label="Predictions CSV", interactive=False)
-                report_btn = gr.Button("Pattern Report generieren")
-                report_status = gr.Textbox(label="Report-Status", interactive=False)
-                report_preview = gr.Markdown(label="Report Vorschau")
-                report_download = gr.File(label="Report Download", interactive=False)
-                pattern_btn = gr.Button("Musteranalyse starten")
-                pattern_status = gr.Textbox(label="Muster-Status", interactive=False)
-                pattern_preview = gr.Markdown(label="Automatisch erkannte Muster")
-                pattern_download = gr.File(label="Muster Download", interactive=False)
-                feedback_user = gr.Textbox(label="Prüfer:in", value="")
-                feedback_comment = gr.Textbox(label="Feedback-Kommentar", lines=2)
-                feedback_index = gr.Number(label="Zeilenindex (Feedback)", value=0, precision=0)
-                feedback_tp_btn = gr.Button("✅ True Positive")
-                feedback_fp_btn = gr.Button("❌ False Positive")
-                feedback_status = gr.Textbox(label="Feedback-Status", interactive=False)
-                feedback_report_btn = gr.Button("Feedback-Report")
-                feedback_report_status = gr.Textbox(label="Feedback-Report-Status", interactive=False)
-                feedback_report_preview = gr.Markdown(label="Feedback Report Vorschau")
-                feedback_report_download = gr.File(label="Feedback Report Download", interactive=False)
+            gr.Markdown("## Baseline Modell")
+            baseline_btn = gr.Button("Baseline trainieren")
+            baseline_status = gr.Textbox(label="Training-Status", interactive=False)
+            metrics_json = gr.JSON(label="Metriken")
+            confusion_df = gr.Dataframe(label="Konfusionsmatrix", interactive=False)
+            model_download = gr.File(label="Baseline Modell", interactive=False)
+            metrics_download = gr.File(label="Metrics JSON", interactive=False)
+            importance_table = gr.Dataframe(label="Feature Importances", interactive=False)
+            importance_plot = gr.Image(label="Feature Importances Plot", interactive=False)
+            importance_download = gr.File(label="Feature Importances CSV", interactive=False)
+            predictions_table = gr.Dataframe(label="Predictions", interactive=False)
+            predictions_download = gr.File(label="Predictions CSV", interactive=False)
 
-            with gr.Tab("Maßnahmen-Analyse"):
-                gr.Markdown("## Hybrid Prediction: Rules + ML")
-                with gr.Row():
-                    rule_coverage_box = gr.Textbox(label="Rule Coverage", interactive=False)
-                    ml_fallback_box = gr.Textbox(label="ML Fallback Rate", interactive=False)
-                massnahmen_distribution_plot = gr.BarPlot(
-                    label="Verteilung vorhergesagter Maßnahmen",
-                    x="Massnahme",
-                    y="Anzahl",
-                )
+            gr.Markdown("## Feedback")
+            with gr.Row():
+                feedback_index = gr.Number(label="Zeilenindex", value=0, precision=0)
+                feedback_user = gr.Textbox(label="Benutzer", value="analyst")
+                feedback_comment = gr.Textbox(label="Kommentar", placeholder="optional")
+            with gr.Row():
+                feedback_tp_btn = gr.Button("Maßnahme korrekt")
+                feedback_fp_btn = gr.Button("Maßnahme falsch")
+            feedback_status = gr.Textbox(label="Feedback-Status", interactive=False)
+            feedback_report_btn = gr.Button("Feedback-Report erzeugen")
+            feedback_report_status = gr.Textbox(label="Report-Status", interactive=False)
+            feedback_report_preview = gr.Dataframe(label="Feedback Report", interactive=False)
+            feedback_report_download = gr.File(label="Feedback Report Download", interactive=False)
 
-                gr.Markdown("### Einzel-Erklärung")
-                with gr.Row():
-                    explain_index = gr.Number(label="Zeilenindex", value=0, precision=0)
-                    explain_btn = gr.Button("Erklärung anzeigen")
-                explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
-                rule_explanation = gr.Markdown(label="Erklärung")
-                explain_download = gr.File(label="Erklärungs-Download", interactive=False)
+            gr.Markdown("## Musteranalyse")
+            pattern_btn = gr.Button("Auffällige Muster analysieren")
+            pattern_status = gr.Textbox(label="Muster-Status", interactive=False)
+            pattern_preview = gr.Dataframe(label="Auffällige Muster", interactive=False)
+            pattern_download = gr.File(label="Muster Download", interactive=False)
+            report_btn = gr.Button("Report generieren")
+            report_status = gr.Textbox(label="Report-Status", interactive=False)
+            report_preview = gr.Markdown(label="Report Vorschau")
+            report_download = gr.File(label="Report Download", interactive=False)
 
-            with gr.Tab("Konfiguration"):
-                config_info = gr.JSON(label="Aktive Konfiguration", value={})
-                column_selector = gr.CheckboxGroup(label="Spalten für das Training", choices=[])
-                balance_checkbox = gr.Checkbox(label="Ampel-Klassenbalancierung (Oversampling)", value=False)
-                column_status = gr.Textbox(label="Konfigurations-Status", interactive=False)
+        gr.Markdown("## Maßnahmen-Analyse")
+        with gr.Column():
+            with gr.Row():
+                rule_coverage_box = gr.Textbox(label="Rule Coverage", interactive=False)
+                ml_fallback_box = gr.Textbox(label="ML Fallback Rate", interactive=False)
+            massnahmen_distribution_plot = gr.BarPlot(
+                label="Verteilung vorhergesagter Maßnahmen",
+                x="Massnahme",
+                y="Anzahl",
+            )
 
-            with gr.Tab("Synthetische Daten"):
-                gr.HTML(_tooltip_label(
-                    "Ausgangsdatei (Excel)",
-                    "Referenzdaten (z. B. `Veri-Bsp.xlsx`). Struktur, Spalten & Wertebereich leiten daraus die Synthese ab."
-                ))
-                synth_base = gr.File(show_label=False, file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+            gr.Markdown("### Einzel-Erklärung")
+            with gr.Row():
+                explain_index = gr.Number(label="Zeilenindex", value=0, precision=0)
+                explain_btn = gr.Button("Erklärung anzeigen")
+            explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
+            rule_explanation = gr.Markdown(label="Erklärung")
+            explain_download = gr.File(label="Erklärungs-Download", interactive=False)
 
-                gr.HTML(_tooltip_label(
-                    "Config (optional)",
-                    "Pipeline-Overrides für Spalten, Textfeatures etc. Leer lassen → Standard `configs/default.yaml` wird genutzt."
-                ))
-                synth_config = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+        gr.Markdown("## Konfiguration")
+        with gr.Column():
+            config_info = gr.JSON(label="Aktive Konfiguration", value={})
+            column_selector = gr.CheckboxGroup(label="Spalten für das Training", choices=[])
+            balance_checkbox = gr.Checkbox(label="Ampel-Klassenbalancierung (Oversampling)", value=False)
+            column_status = gr.Textbox(label="Konfigurations-Status", interactive=False)
 
-                with gr.Row():
-                    with gr.Column():
-                        gr.HTML(_tooltip_label(
-                            "Business Rules (optional)",
-                            "Eigene Geschäftslogik (MwSt, Fixwerte). Alternativ unten im YAML-Editor anpassen."
-                        ))
-                        synth_business_rules = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
-                    with gr.Column():
-                        gr.HTML(_tooltip_label(
-                            "Profil (optional)",
-                            "Vordefinierte Variation/Textpools. Leer lassen → `invoice_profile.yaml`. Änderungen über den YAML-Editor möglich."
-                        ))
-                        synth_profile = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
-                gr.HTML(_tooltip_label(
-                    "Business Rules Override (YAML)",
-                    "Vorbelegung aus `configs/business_rules.yaml`. Hier direkt anpassen statt Datei hochzuladen."
-                ))
-                synth_business_rules_text = gr.Textbox(
-                    show_label=False,
-                    placeholder="Optional: YAML direkt bearbeiten",
-                    lines=10,
-                    value=default_business_rules_text,
-                )
-                gr.HTML(_tooltip_label(
-                    "Profil Override (YAML)",
-                    "Vorbelegung aus `configs/invoice_profile.yaml`. Ergänze z. B. neue Value-Pools oder Variation-Skalen."
-                ))
-                synth_profile_text = gr.Textbox(
-                    show_label=False,
-                    placeholder="Optional: YAML direkt bearbeiten",
-                    lines=10,
-                    value=default_profile_text,
-                )
-                gr.HTML(_tooltip_label(
-                    "GPT-Verfeinerung verwenden",
-                    "Aktiviert sprachliche Verfeinerung (z. B. plausiblere Hinweise). Erhöht Laufzeit und API-Kosten."
-                ))
-                synth_gpt_enable = gr.Checkbox(show_label=False, value=True)
-                gr.HTML(_tooltip_label(
-                    "GPT-Modell",
-                    "Welches OpenAI-Modell für Textplausibilisierung und Bias-Regeln genutzt wird."
-                ))
-                synth_gpt_model = gr.Dropdown(choices=["gpt-5-mini", "gpt-5", "gpt-4.1-mini"], value="gpt-5-mini", show_label=False)
+        gr.Markdown("## Synthetische Daten")
+        with gr.Column():
+            gr.HTML(_tooltip_label(
+                "Ausgangsdatei (Excel)",
+                "Referenzdaten (z. B. `Veri-Bsp.xlsx`). Struktur, Spalten & Wertebereich leiten daraus die Synthese ab."
+            ))
+            synth_base = gr.File(show_label=False, file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
 
-                gr.HTML(_tooltip_label(
-                    "OpenAI API Key",
-                    "Nur notwendig, wenn GPT aktiviert ist. Der Key wird während des Laufs gesetzt und danach entfernt."
-                ))
-                synth_gpt_key = gr.Textbox(type="password", show_label=False)
+            gr.HTML(_tooltip_label(
+                "Config (optional)",
+                "Pipeline-Overrides für Spalten, Textfeatures etc. Leer lassen → Standard `configs/default.yaml` wird genutzt."
+            ))
+            synth_config = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
 
-                gr.HTML(_tooltip_label(
-                    "Bias-Prompt (optional)",
-                    "Natürliche Sprache → zusätzliche Regeln. Beispiel: 'Erhöhe Ampel Gelb um 5 %, wenn Belegdatum ein Montag ist.' Erfordert GPT."
-                ))
-                synth_bias_prompt = gr.Textbox(
-                    show_label=False,
-                    placeholder="Beschreibe gewünschte Tendenzen für die synthetischen Daten",
-                    lines=4,
-                )
-                with gr.Row():
-                    synth_bias_button = gr.Button("Bias-Regeln generieren")
-                    synth_bias_status = gr.Textbox(label="Bias-Status", interactive=False)
-                synth_bias_yaml = gr.Textbox(
-                    label="Bias-Regeln (YAML)",
-                    placeholder="Hier erscheinen die generierten Bias-Regeln – optional editierbar",
-                    lines=8,
-                    value="",
-                )
-                gr.HTML(_tooltip_label(
-                    "Variation",
-                    "0 = minimale Mutationen (Original fast kopiert), 1 = starke Abweichungen (neue Texte/Beträge). Beispiel: 0.3 erzeugt leichte Textvarianten."
-                ))
-                synth_variation = gr.Slider(0.0, 1.0, value=0.35, step=0.05, show_label=False)
-                with gr.Row():
-                    with gr.Column():
-                        gr.HTML(_tooltip_label(
-                            "Ziel-Zeilen (pro Sheet)",
-                            "Absolute Anzahl zusätzlicher Zeilen je Blatt. Überschreibt das Ratio. Beispiel: 250 → jeweils 250 synthetische Zeilen."
-                        ))
-                        synth_lines = gr.Number(value=100, precision=0, show_label=False)
-                    with gr.Column():
-                        gr.HTML(_tooltip_label(
-                            "Ratio (optional)",
-                            "Relative Menge im Vergleich zur Vorlage (1.0 = gleich viele Zeilen). Wird ignoriert, wenn Ziel-Zeilen gesetzt sind."
-                        ))
-                        synth_ratio = gr.Number(value=None, show_label=False)
-                    with gr.Column():
-                        gr.HTML(_tooltip_label(
-                            "Seed",
-                            "Deterministischer Zufalls-Seed. Gleiche Eingaben + Seed → reproduzierbare Ergebnisse."
-                        ))
-                        synth_seed = gr.Number(value=1234, precision=0, show_label=False)
+            with gr.Row():
+                with gr.Column():
+                    gr.HTML(_tooltip_label(
+                        "Business Rules (optional)",
+                        "Eigene Geschäftslogik (MwSt, Fixwerte). Alternativ unten im YAML-Editor anpassen."
+                    ))
+                    synth_business_rules = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+                with gr.Column():
+                    gr.HTML(_tooltip_label(
+                        "Profil (optional)",
+                        "Vordefinierte Variation/Textpools. Leer lassen → `invoice_profile.yaml`. Änderungen über den YAML-Editor möglich."
+                    ))
+                    synth_profile = gr.File(show_label=False, file_types=[".yaml", ".yml", ".json"])  # type: ignore[arg-type]
+            gr.HTML(_tooltip_label(
+                "Business Rules Override (YAML)",
+                "Vorbelegung aus `configs/business_rules.yaml`. Hier direkt anpassen statt Datei hochzuladen."
+            ))
+            synth_business_rules_text = gr.Code(
+                label="Business Rules (YAML)",
+                value=default_business_rules_text,
+                language="yaml",
+            )
+            gr.HTML(_tooltip_label(
+                "Profil Override (YAML)",
+                "Base-Profile (Lieferzeiten etc.). Leer lassen → Standardprofil."
+            ))
+            synth_profile_text = gr.Code(
+                label="Profil (YAML)",
+                value=default_profile_text,
+                language="yaml",
+            )
+            with gr.Row():
+                synth_gpt_enable = gr.Checkbox(label="GPT verwenden", value=True)
+                synth_gpt_model = gr.Textbox(label="GPT-Modell", value="gpt-5-mini")
+                synth_gpt_key = gr.Textbox(label="OpenAI API-Key", type="password")
+            gr.HTML(_tooltip_label(
+                "Bias-Prompt",
+                "Textbeschreibung geplanter Verzerrungen (z. B. höherer Fraud-Anteil an Wochenenden)."
+            ))
+            synth_bias_prompt = gr.Textbox(label="Bias-Prompt", placeholder="z. B. Erhöhe Fraud am Wochenende")
+            synth_bias_button = gr.Button("Bias-Regeln generieren")
+            synth_bias_status = gr.Textbox(label="Bias-Status", interactive=False)
+            synth_bias_yaml = gr.Textbox(
+                label="Bias-Regeln (YAML)",
+                placeholder="Hier erscheinen die generierten Bias-Regeln – optional editierbar",
+                lines=8,
+                value="",
+            )
+            gr.HTML(_tooltip_label(
+                "Variation",
+                "0 = minimale Mutationen (Original fast kopiert), 1 = starke Abweichungen (neue Texte/Beträge). Beispiel: 0.3 erzeugt leichte Textvarianten."
+            ))
+            synth_variation = gr.Slider(0.0, 1.0, value=0.35, step=0.05, show_label=False)
+            with gr.Row():
+                with gr.Column():
+                    gr.HTML(_tooltip_label(
+                        "Ziel-Zeilen (pro Sheet)",
+                        "Absolute Anzahl zusätzlicher Zeilen je Blatt. Überschreibt das Ratio. Beispiel: 250 → jeweils 250 synthetische Zeilen."
+                    ))
+                    synth_lines = gr.Number(value=100, precision=0, show_label=False)
+                with gr.Column():
+                    gr.HTML(_tooltip_label(
+                        "Ratio (optional)",
+                        "Relative Menge im Vergleich zur Vorlage (1.0 = gleich viele Zeilen). Wird ignoriert, wenn Ziel-Zeilen gesetzt sind."
+                    ))
+                    synth_ratio = gr.Number(value=None, show_label=False)
+                with gr.Column():
+                    gr.HTML(_tooltip_label(
+                        "Seed",
+                        "Deterministischer Zufalls-Seed. Gleiche Eingaben + Seed → reproduzierbare Ergebnisse."
+                    ))
+                    synth_seed = gr.Number(value=1234, precision=0, show_label=False)
 
-                gr.HTML(_tooltip_label(
-                    "Debug-Logging aktivieren",
-                    "Schreibt detaillierte Synthesizer-Logs (z. B. pro Tabelle). Hilfreich beim Debugging, erzeugt aber mehr Output."
-                ))
-                synth_debug = gr.Checkbox(show_label=False, value=False)
-                synth_bias_prompt.info = "Verwendet GPT, um Wahrscheinlichkeiten z. B. anhand von Wochentagen oder Betragsmustern anzupassen."
-                synth_gpt_model.info = "Welches OpenAI-Modell für Textplausibilisierung genutzt wird."
-                synth_gpt_key.info = "API-Key nur nötig, wenn GPT aktiv ist. Wird temporär gesetzt und nach dem Lauf wieder entfernt."
-                synth_debug.info = "Schreibt detaillierte Fortschrittslogs (z. B. pro Tabelle). Gut zum Troubleshooting, verlängert ggf. den Output."
-                synth_button = gr.Button("Synthetische Daten erzeugen")
-                synth_status = gr.Textbox(label="Generator-Status", interactive=False)
-                synth_preview = gr.Dataframe(label="Vorschau der synthetischen Daten", interactive=False)
-                synth_download = gr.File(label="Download Synthetic Workbook", interactive=False)
-                synth_quality = gr.File(label="Download Quality Report", interactive=False)
-                synth_log = gr.Textbox(label="Generator-Log", lines=12, interactive=False)
+            gr.HTML(_tooltip_label(
+                "Debug-Logging aktivieren",
+                "Schreibt detaillierte Synthesizer-Logs (z. B. pro Tabelle). Hilfreich beim Debugging, erzeugt aber mehr Output."
+            ))
+            synth_debug = gr.Checkbox(show_label=False, value=False)
+            synth_bias_prompt.info = "Verwendet GPT, um Wahrscheinlichkeiten z. B. anhand von Wochentagen oder Betragsmustern anzupassen."
+            synth_gpt_model.info = "Welches OpenAI-Modell für Textplausibilisierung genutzt wird."
+            synth_gpt_key.info = "API-Key nur nötig, wenn GPT aktiv ist. Wird temporär gesetzt und nach dem Lauf wieder entfernt."
+            synth_debug.info = "Schreibt detaillierte Fortschrittslogs (z. B. pro Tabelle). Gut zum Troubleshooting, verlängert ggf. den Output."
+            synth_button = gr.Button("Synthetische Daten erzeugen")
+            synth_status = gr.Textbox(label="Generator-Status", interactive=False)
+            synth_preview = gr.Dataframe(label="Vorschau der synthetischen Daten", interactive=False)
+            synth_download = gr.File(label="Download Synthetic Workbook", interactive=False)
+            synth_quality = gr.File(label="Download Quality Report", interactive=False)
+            synth_log = gr.Textbox(label="Generator-Log", lines=12, interactive=False)
 
-            with gr.Tab("Batch Prediction"):
-                batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
-                batch_button = gr.Button("Belege prüfen")
-                batch_status = gr.Textbox(label="Batch-Status", interactive=False)
-                batch_download = gr.File(label="Batch Download", interactive=False)
-
-        menu_output_pairs = [
-            ("menu_status", menu_status),
-            ("menu_download", menu_download),
-            ("state", state),
-            ("file_input", file_input),
-            ("folder_input", folder_input),
-            ("config_input", config_input),
-            ("sheet_input", sheet_input),
-            ("target_input", target_input),
-            ("load_status", load_status),
-            ("data_preview", data_preview),
-            ("schema_json", schema_json),
-            ("build_status", build_status),
-            ("plan_json", plan_json),
-            ("prep_download", prep_download),
-            ("preview_status", preview_status),
-            ("preview_table", preview_table),
-            ("baseline_status", baseline_status),
-            ("metrics_json", metrics_json),
-            ("confusion_df", confusion_df),
-            ("model_download", model_download),
-            ("metrics_download", metrics_download),
-            ("importance_table", importance_table),
-            ("importance_plot", importance_plot),
-            ("importance_download", importance_download),
-            ("predictions_table", predictions_table),
-            ("predictions_download", predictions_download),
-            ("rule_coverage", rule_coverage_box),
-            ("ml_fallback", ml_fallback_box),
-            ("massnahmen_distribution", massnahmen_distribution_plot),
-            ("explain_index", explain_index),
-            ("explain_status", explain_status),
-            ("rule_explanation", rule_explanation),
-            ("explain_download", explain_download),
-            ("report_status", report_status),
-            ("report_preview", report_preview),
-            ("report_download", report_download),
-            ("pattern_status", pattern_status),
-            ("pattern_preview", pattern_preview),
-            ("pattern_download", pattern_download),
-            ("feedback_user", feedback_user),
-            ("feedback_comment", feedback_comment),
-            ("feedback_index", feedback_index),
-            ("feedback_status", feedback_status),
-            ("feedback_report_status", feedback_report_status),
-            ("feedback_report_preview", feedback_report_preview),
-            ("feedback_report_download", feedback_report_download),
-            ("config_info", config_info),
-            ("column_status", column_status),
-            ("column_selector", column_selector),
-            ("balance_checkbox", balance_checkbox),
-            ("synth_base", synth_base),
-            ("synth_config", synth_config),
-            ("synth_business_rules", synth_business_rules),
-            ("synth_profile", synth_profile),
-            ("synth_business_rules_text", synth_business_rules_text),
-            ("synth_profile_text", synth_profile_text),
-            ("synth_gpt_enable", synth_gpt_enable),
-            ("synth_gpt_model", synth_gpt_model),
-            ("synth_gpt_key", synth_gpt_key),
-            ("synth_bias_prompt", synth_bias_prompt),
-            ("synth_bias_status", synth_bias_status),
-            ("synth_bias_yaml", synth_bias_yaml),
-            ("synth_variation", synth_variation),
-            ("synth_lines", synth_lines),
-            ("synth_ratio", synth_ratio),
-            ("synth_seed", synth_seed),
-            ("synth_debug", synth_debug),
-            ("synth_status", synth_status),
-            ("synth_preview", synth_preview),
-            ("synth_download", synth_download),
-            ("synth_quality", synth_quality),
-            ("synth_log", synth_log),
-            ("batch_file", batch_file),
-            ("batch_status", batch_status),
-            ("batch_download", batch_download),
-        ]
-        menu_output_names = [name for name, _ in menu_output_pairs]
-        menu_outputs = [component for _, component in menu_output_pairs]
-
-        training_reset_updates = {
-            "file_input": gr.update(value=None),
-            "folder_input": "",
-            "config_input": gr.update(value=None),
-            "sheet_input": sheet_default,
-            "target_input": target_default,
-            "load_status": "",
-            "data_preview": gr.update(value=None),
-            "schema_json": gr.update(value=None),
-            "build_status": "",
-            "plan_json": gr.update(value=None),
-            "prep_download": gr.update(value=None),
-            "preview_status": "",
-            "preview_table": gr.update(value=None),
-            "baseline_status": "",
-            "metrics_json": gr.update(value=None),
-            "confusion_df": gr.update(value=None),
-            "model_download": gr.update(value=None),
-            "metrics_download": gr.update(value=None),
-            "importance_table": gr.update(value=None),
-            "importance_plot": gr.update(value=None),
-            "importance_download": gr.update(value=None),
-            "predictions_table": gr.update(value=None),
-            "predictions_download": gr.update(value=None),
-            "rule_coverage": "",
-            "ml_fallback": "",
-            "massnahmen_distribution": gr.update(value=None),
-            "explain_index": 0,
-            "explain_status": "",
-            "rule_explanation": gr.update(value=""),
-            "explain_download": gr.update(value=None),
-            "report_status": "",
-            "report_preview": gr.update(value=""),
-            "report_download": gr.update(value=None),
-            "pattern_status": "",
-            "pattern_preview": gr.update(value=""),
-            "pattern_download": gr.update(value=None),
-            "column_status": "",
-            "feedback_user": "",
-            "feedback_comment": "",
-            "feedback_index": 0,
-            "feedback_status": "",
-            "feedback_report_status": "",
-            "feedback_report_preview": gr.update(value=""),
-            "feedback_report_download": gr.update(value=None),
-        }
-
-        synth_reset_updates = {
-            "synth_base": gr.update(value=None),
-            "synth_config": gr.update(value=None),
-            "synth_business_rules": gr.update(value=None),
-            "synth_profile": gr.update(value=None),
-            "synth_business_rules_text": default_business_rules_text,
-            "synth_profile_text": default_profile_text,
-            "synth_gpt_enable": True,
-            "synth_gpt_model": "gpt-5-mini",
-            "synth_gpt_key": "",
-            "synth_bias_prompt": "",
-            "synth_bias_status": "",
-            "synth_bias_yaml": "",
-            "synth_variation": 0.35,
-            "synth_lines": 100,
-            "synth_ratio": gr.update(value=None),
-            "synth_seed": 1234,
-            "synth_debug": False,
-            "synth_status": "",
-            "synth_preview": gr.update(value=None),
-            "synth_download": gr.update(value=None),
-            "synth_quality": gr.update(value=None),
-            "synth_log": "",
-        }
-
-        batch_reset_updates = {
-            "batch_file": gr.update(value=None),
-            "batch_status": "",
-            "batch_download": gr.update(value=None),
-        }
-
-        menu_defaults = {
-            "action_map": menu_action_map,
-            "output_names": menu_output_names,
-            "training_reset": training_reset_updates,
-            "synth_reset": synth_reset_updates,
-            "batch_reset": batch_reset_updates,
-        }
-
-        menu_button.click(
-            partial(
-                handle_menu_action,
-                defaults=menu_defaults,
-            ),
-            inputs=[
-                menu_action,
-                state,
-                file_input,
-                folder_input,
-                config_input,
-                sheet_input,
-                target_input,
-                explain_index,
-                feedback_user,
-                feedback_comment,
-                feedback_index,
-                column_selector,
-                balance_checkbox,
-                synth_base,
-                synth_config,
-                synth_business_rules,
-                synth_profile,
-                synth_business_rules_text,
-                synth_profile_text,
-                synth_gpt_enable,
-                synth_gpt_model,
-                synth_gpt_key,
-                synth_bias_prompt,
-                synth_bias_yaml,
-                synth_variation,
-                synth_lines,
-                synth_ratio,
-                synth_seed,
-                synth_debug,
-                batch_file,
-                rule_coverage_box,
-                ml_fallback_box,
-                massnahmen_distribution_plot,
-                rule_explanation,
-            ],
-            outputs=menu_outputs,
-        )
+        gr.Markdown("## Batch Prediction")
+        with gr.Column():
+            batch_file = gr.File(label="Excel-Datei", file_types=[".xlsx", ".xls"])  # type: ignore[arg-type]
+            batch_button = gr.Button("Belege prüfen")
+            batch_status = gr.Textbox(label="Batch-Status", interactive=False)
+            batch_download = gr.File(label="Batch Download", interactive=False)
 
         load_btn.click(
             load_dataset,

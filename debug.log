@@ -1,0 +1,66 @@
+Using selector: KqueueSelector
+Using selector: KqueueSelector
+connect_tcp.started host='127.0.0.1' port=7860 local_address=None timeout=None socket_options=None
+connect_tcp.complete return_value=<httpcore._backends.sync.SyncStream object at 0x31745ac90>
+send_request_headers.started request=<Request [b'GET']>
+send_request_headers.complete
+send_request_body.started request=<Request [b'GET']>
+send_request_body.complete
+receive_response_headers.started request=<Request [b'GET']>
+receive_response_headers.complete return_value=(b'HTTP/1.1', 200, b'OK', [(b'date', b'Fri, 17 Oct 2025 08:48:27 GMT'), (b'server', b'uvicorn'), (b'content-length', b'4'), (b'content-type', b'application/json')])
+HTTP Request: GET http://127.0.0.1:7860/startup-events "HTTP/1.1 200 OK"
+receive_response_body.started request=<Request [b'GET']>
+receive_response_body.complete
+response_closed.started
+response_closed.complete
+close.started
+close.complete
+connect_tcp.started host='127.0.0.1' port=7860 local_address=None timeout=3 socket_options=None
+connect_tcp.complete return_value=<httpcore._backends.sync.SyncStream object at 0x317641110>
+send_request_headers.started request=<Request [b'HEAD']>
+send_request_headers.complete
+send_request_body.started request=<Request [b'HEAD']>
+send_request_body.complete
+receive_response_headers.started request=<Request [b'HEAD']>
+receive_response_headers.complete return_value=(b'HTTP/1.1', 200, b'OK', [(b'date', b'Fri, 17 Oct 2025 08:48:27 GMT'), (b'server', b'uvicorn'), (b'content-length', b'137784'), (b'content-type', b'text/html; charset=utf-8')])
+HTTP Request: HEAD http://127.0.0.1:7860/ "HTTP/1.1 200 OK"
+receive_response_body.started request=<Request [b'HEAD']>
+receive_response_body.complete
+response_closed.started
+response_closed.complete
+close.started
+close.complete
+Calling on_part_begin with no data
+Calling on_header_field with data[42:61]
+Calling on_header_value with data[63:124]
+Calling on_header_end with no data
+Calling on_header_field with data[126:138]
+Calling on_header_value with data[140:205]
+Calling on_header_end with no data
+Calling on_headers_finished with no data
+Calling on_part_data with data[209:81920]
+Calling on_part_data with data[0:51715]
+Calling on_part_end with no data
+Calling on_end with no data
+Calling on_part_begin with no data
+Calling on_header_field with data[42:61]
+Calling on_header_value with data[63:112]
+Calling on_header_end with no data
+Calling on_header_field with data[114:126]
+Calling on_header_value with data[128:193]
+Calling on_header_end with no data
+Calling on_headers_finished with no data
+Calling on_part_data with data[197:41701]
+Calling on_part_end with no data
+Calling on_end with no data
+Calling on_part_begin with no data
+Calling on_header_field with data[42:61]
+Calling on_header_value with data[63:112]
+Calling on_header_end with no data
+Calling on_header_field with data[114:126]
+Calling on_header_value with data[128:193]
+Calling on_header_end with no data
+Calling on_headers_finished with no data
+Calling on_part_data with data[197:41701]
+Calling on_part_end with no data
+Calling on_end with no data
