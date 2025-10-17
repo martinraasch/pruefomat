@@ -225,3 +225,85 @@ def test_pattern_report_multiclass(baseline_state):
     assert "Klassenverteilung" in markdown
     assert "Pattern Report" in markdown
     assert Path(report_path).exists()
+
+
+def test_batch_prediction_rule_columns_preserved(tmp_path, baseline_state):
+    _, _, state = baseline_state
+    state["selected_columns"] = ["Hinweise"]
+
+    df_min = pd.DataFrame(
+        {
+            "Hinweise": ["ok"],
+            "Ampel": [1],
+            "Betrag": ["1.000,00"],
+            "BUK": ["A"],
+            "Debitor": ["100"],
+        }
+    )
+    batch_file = tmp_path / "batch_minimal.xlsx"
+    df_min.to_excel(batch_file, index=False)
+    upload = SimpleNamespace(name=str(batch_file))
+
+    status, download_path = batch_predict_action(upload, state)
+
+    assert "Batch abgeschlossen" in status
+    result_df = pd.read_excel(download_path)
+    match = result_df.loc[result_df["prediction_source"] == "niedrig_betrag_gruene_ampel"]
+    assert not match.empty
+    assert (match["final_prediction"] == "Rechnungsprüfung").all()
+
+
+def test_historical_gutschrift_rule_triggers():
+    data = {
+        "Betrag": ["500,00", "750,00", "600,00", "900,00"],
+        "Ampel": [1, 2, 1, 2],
+        "BUK": ["A", "A", "A", "B"],
+        "Debitor": ["100", "100", "100", "200"],
+        "Hinweise": ["", "", "", ""],
+        "Massnahme_2025": [
+            "Gutschriftsverfahren",
+            "Gutschriftsverfahren",
+            "Gutschriftsverfahren",
+            "Rechnungsprüfung",
+        ],
+    }
+
+    df = pd.DataFrame(data)
+    features_full = df.drop(columns=["Massnahme_2025"])
+    features_selected = features_full[["Betrag", "Ampel"]]
+    target = df["Massnahme_2025"]
+
+    config = DEFAULT_CONFIG.model_copy(deep=True)
+    config.preprocessing.tfidf_min_df = 1
+
+    state = {
+        "config": config,
+        "config_path": str(DEFAULT_CONFIG_PATH),
+        "df_features": features_selected.copy(),
+        "df_features_full": features_full.copy(),
+        "target": target,
+        "selected_columns": list(features_selected.columns),
+    }
+
+    _, _, _, state = build_pipeline_action(state)
+    # Ensure full features remain available for historical lookup
+    state["df_features_full"] = features_full.copy()
+
+    result = train_baseline_action(state)
+    state = result[-1]
+
+    predictor = state["hybrid_predictor"]
+    assert predictor is not None
+
+    new_invoice = pd.DataFrame(
+        {
+            "Betrag": ["1.200,00"],
+            "Ampel": [2],
+            "BUK": ["A"],
+            "Debitor": ["100"],
+        }
+    )
+
+    prediction = predictor.predict(new_invoice)
+    assert prediction.loc[0, "prediction"] == "Gutschriftsverfahren"
+    assert prediction.loc[0, "source"] == "historische_gutschrift_muster"

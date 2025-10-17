@@ -86,6 +86,7 @@ from src.business_rules import BusinessRule, load_business_rules_from_file
 from src.rule_engine import RuleEngine
 from src.hybrid_predictor import HybridMassnahmenPredictor
 from src.train_massnahmen import evaluate_multiclass
+from src.train_binary import parse_money
 
 
 os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
@@ -1957,6 +1958,17 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         stratify=stratify,
     )
 
+    train_indices = X_train.index
+    base_training_source = state.get("df_features_full")
+    if isinstance(base_training_source, pd.DataFrame) and len(base_training_source) == len(df_features):
+        historical_df = base_training_source.loc[train_indices].copy()
+    else:
+        historical_df = df_features.loc[train_indices].copy()
+
+    target_column_name = config.data.target_col or "Massnahme_2025"
+    historical_df = historical_df.reset_index(drop=True)
+    historical_df[target_column_name] = y_train.reset_index(drop=True)
+
     if state.get("balance_classes"):
         X_train, y_train = _balance_training_set(
             X_train.reset_index(drop=True),
@@ -2014,9 +2026,6 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     ml_confidence = proba.max(axis=1)
     ml_prediction = pd.Series(y_pred, name="ml_prediction").reset_index(drop=True)
     ml_confidence_series = pd.Series(ml_confidence, name="ml_confidence").reset_index(drop=True)
-
-    historical_df = X_train.copy()
-    historical_df[config.data.target_col or "Massnahme_2025"] = y_train.reset_index(drop=True)
 
     business_rules: List[BusinessRule] = []
     try:
@@ -2428,6 +2437,7 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     progress(0.05, desc="Lade Datei")
     df_input_raw = pd.read_excel(upload_path)
     df_input, _ = normalize_columns(df_input_raw)
+    rule_context = df_input.copy()
 
     df_negativ = None
     if "negativ" in df_input.columns:
@@ -2444,6 +2454,7 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
             df_negativ["final_confidence"] = 1.0
             df_negativ["prediction_source"] = "negativ_flag"
             df_input = df_input.loc[~negativ_mask].copy()
+            rule_context = rule_context.loc[~negativ_mask].copy()
         else:
             df_negativ = None
         df_input = df_input.drop(columns=["negativ"])
@@ -2460,6 +2471,41 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     for col in missing:
         df_input[col] = np.nan
     df_input = df_input[selected_columns]
+
+    required_columns = {
+        "Ampel",
+        config.data.amount_col or "Betrag",
+        "Betrag_parsed",
+        "BUK",
+        "Debitor",
+        "negativ",
+    }
+
+    df_augmented = df_input.copy()
+    rule_lookup = rule_context.reindex(df_augmented.index)
+
+    amount_source_column = config.data.amount_col or "Betrag"
+    currency_symbols = ["€", "EUR", " "]
+
+    for column in required_columns:
+        if column in df_augmented.columns:
+            continue
+        if column == "Betrag_parsed":
+            if column in rule_lookup.columns:
+                series = rule_lookup[column]
+            elif amount_source_column in rule_lookup.columns:
+                series = parse_money(rule_lookup[amount_source_column], currency_symbols)
+            else:
+                series = pd.Series(np.nan, index=df_augmented.index)
+            df_augmented[column] = series
+            continue
+
+        if column in rule_lookup.columns:
+            df_augmented[column] = rule_lookup[column]
+        else:
+            df_augmented[column] = np.nan
+
+    df_input = df_augmented
 
     progress(0.3, desc="Berechne Maßnahmen")
 
