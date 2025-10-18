@@ -156,10 +156,23 @@ def baseline_state():
     }
     pipeline_result = build_pipeline_action(state)
     state = pipeline_result[-1]
-    result = train_baseline_action(state)
-    metrics = result[1]
-    predictions = result[8]
-    updated_state = result[-1]
+    (
+        status,
+        metrics,
+        confusion_df,
+        confusion_plot,
+        model_path,
+        metrics_path,
+        importance_table,
+        importance_plot_path,
+        importance_csv_path,
+        predictions,
+        predictions_path,
+        rule_cov_display,
+        ml_fallback_display,
+        distribution,
+        updated_state,
+    ) = train_baseline_action(state)
     return metrics, predictions, updated_state
 
 
@@ -175,18 +188,24 @@ def test_recall_metrics(baseline_state):
     assert "recall" in metrics
     assert "precision" in metrics
     assert "f2_score" in metrics
+    assert "samples" in metrics
+    assert metrics["samples"]["validation"] > 0
 
 
 def test_confidence_scores(baseline_state):
     _, predictions, _ = baseline_state
     assert "final_confidence" in predictions
     assert predictions["final_confidence"].between(0, 1).all()
+    assert "review_score" in predictions
+    assert predictions["review_score"].between(0, 1).all()
 
 
 def test_threshold_application(baseline_state):
     _, predictions, _ = baseline_state
     assert "final_prediction" in predictions
     assert predictions["final_prediction"].notna().all()
+    assert "is_correct" in predictions
+    assert set(predictions["is_correct"].unique()).issubset({True, False})
 
 
 def test_shap_explanations(baseline_state):
@@ -235,6 +254,32 @@ def test_feedback_flow(baseline_state, feedback_db):
     report_status, report_text, report_path, _ = feedback_report_action(state)
     assert isinstance(report_status, str)
     assert Path(report_path).exists()
+
+
+def test_top_k_metrics_and_cost_simulation(baseline_state):
+    metrics, predictions, _ = baseline_state
+    top_k = metrics.get("top_k_hit_rate")
+    assert top_k is not None
+    assert 0 < top_k["k"] <= len(metrics["classes"])
+    assert 0.0 <= top_k["hit_rate"] <= 1.0
+
+    cost_sim = metrics.get("cost_simulation")
+    assert cost_sim is not None
+    for key in ("review_share", "cost_review", "cost_miss", "net_benefit_top_share", "net_benefit_full_review"):
+        assert key in cost_sim
+
+
+def test_confusion_heatmap_is_created(baseline_state):
+    _, _, state = baseline_state
+    heatmap_path = state.get("confusion_heatmap")
+    assert heatmap_path is not None
+    assert Path(heatmap_path).exists()
+
+
+def test_status_message_contains_accuracy(baseline_state):
+    _, _, state = baseline_state
+    status, *_ = train_baseline_action(state)
+    assert "Genauigkeit" in status
 
 
 def test_pattern_report_multiclass(baseline_state):

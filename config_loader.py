@@ -75,6 +75,7 @@ class AppConfig(BaseModel):
     preprocessing: PreprocessingSection = Field(default_factory=PreprocessingSection)
     model: ModelSection = Field(default_factory=ModelSection)
     pattern_analysis: "PatternAnalysisSection" = Field(default_factory=lambda: PatternAnalysisSection())
+    evaluation: "EvaluationSection" = Field(default_factory=lambda: EvaluationSection())
 
 
 class NumericFeatureOptions(BaseModel):
@@ -106,6 +107,35 @@ class PatternAnalysisSection(BaseModel):
     max_p_value: float = 0.05
     max_feature_values: int = 30
     top_n: int = 40
+
+
+class EvaluationSection(BaseModel):
+    validation_size: float = Field(default=0.25, description="Fraction of samples used for validation.")
+    top_k: int = Field(default=3, description="Number of top predictions considered for hit-rate metrics.")
+    review_share: float = Field(default=0.2, description="Fraction of predictions to review in cost simulation.")
+    cost_review: float = Field(default=50.0, description="Cost per manual review in simulation.")
+    cost_miss: float = Field(default=250.0, description="Cost for missing an incorrect prediction in simulation.")
+
+    @field_validator("validation_size", "review_share")
+    @classmethod
+    def _fraction_range(cls, value: float) -> float:
+        if not 0 < value <= 0.9:
+            raise ValueError("fractions must be in (0, 0.9]")
+        return value
+
+    @field_validator("top_k")
+    @classmethod
+    def _top_k_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("top_k must be >= 1")
+        return value
+
+    @field_validator("cost_review", "cost_miss")
+    @classmethod
+    def _non_negative(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("cost values must be non-negative")
+        return value
 
 
 class ConfigError(RuntimeError):
@@ -185,4 +215,5 @@ __all__ = [
     "load_config",
     "normalize_config_columns",
     "PatternAnalysisSection",
+    "EvaluationSection",
 ]

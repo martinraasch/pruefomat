@@ -65,7 +65,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 
-from config_loader import AppConfig, ConfigError, load_config, normalize_config_columns
+from config_loader import AppConfig, ConfigError, EvaluationSection, load_config, normalize_config_columns
 from build_pipeline_veri import (
     NULL_LIKE_DEFAULT,
     DataFramePreparer,
@@ -87,6 +87,7 @@ from src.business_rules import BusinessRule, load_business_rules_from_file
 from src.rule_engine import RuleEngine
 from src.hybrid_predictor import HybridMassnahmenPredictor
 from src.train_massnahmen import evaluate_multiclass
+from src.eval_utils import compute_cost_simulation
 from src.train_binary import parse_money
 
 
@@ -1972,6 +1973,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             empty_update,
             empty_update,
             empty_update,
+            empty_update,
             empty_text,
             empty_text,
             empty_update,
@@ -1989,6 +1991,12 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     target_series = target_series.apply(normalize_massnahme)
 
     config = _ensure_config(state)
+    evaluation_cfg: EvaluationSection = getattr(config, "evaluation", EvaluationSection())
+    validation_fraction = float(getattr(evaluation_cfg, "validation_size", 0.25))
+    top_k_eval = int(getattr(evaluation_cfg, "top_k", 3))
+    review_share = float(getattr(evaluation_cfg, "review_share", 0.2))
+    cost_review = float(getattr(evaluation_cfg, "cost_review", 50.0))
+    cost_miss = float(getattr(evaluation_cfg, "cost_miss", 250.0))
     rf_kwargs = config.model.random_forest.model_dump(exclude_none=True)
 
     baseline = Pipeline(
@@ -1998,7 +2006,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         ]
     )
 
-    test_size_count, stratify = _compute_split_params(target_series)
+    test_size_count, stratify = _compute_split_params(target_series, default_test_size=validation_fraction)
     X_train, X_test, y_train, y_test = train_test_split(
         df_features,
         target_series,
@@ -2006,6 +2014,10 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         random_state=config.model.random_forest.random_state,
         stratify=stratify,
     )
+
+    train_count = len(X_train)
+    validation_count = len(X_test)
+    total_count = max(train_count + validation_count, 1)
 
     train_indices = X_train.index
     base_training_source = state.get("df_features_full")
@@ -2051,6 +2063,13 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     metrics["recall"] = float(recall_score(y_test_encoded, y_pred_encoded, average="macro", zero_division=0))
     metrics["precision"] = float(precision_score(y_test_encoded, y_pred_encoded, average="macro", zero_division=0))
     metrics["f2_score"] = float(fbeta_score(y_test_encoded, y_pred_encoded, beta=2.0, average="macro", zero_division=0))
+    metrics["samples"] = {
+        "train": int(train_count),
+        "validation": int(validation_count),
+        "validation_fraction_actual": float(validation_count / total_count),
+        "validation_fraction_config": float(validation_fraction),
+    }
+    metrics["accuracy_display"] = f"In {metrics['accuracy']:.0%} der Fälle richtig"
 
     confusion = np.asarray(metrics_summary["confusion_matrix"], dtype=float)
     label_lookup = {idx: cls for idx, cls in enumerate(classes)}
@@ -2072,6 +2091,20 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     top20 = importance_df.head(20).reset_index(drop=True)
 
     proba = baseline.predict_proba(X_test)
+    if proba.size:
+        effective_top_k = min(max(top_k_eval, 1), proba.shape[1])
+        sorted_indices = np.argsort(proba, axis=1)[:, ::-1][:, :effective_top_k]
+        hits = (sorted_indices == y_test_encoded.reshape(-1, 1)).any(axis=1)
+        top_k_hit_rate = float(hits.mean()) if len(hits) else 0.0
+    else:  # pragma: no cover - defensive
+        effective_top_k = min(top_k_eval, len(classes)) if classes else top_k_eval
+        top_k_hit_rate = 0.0
+    metrics["top_k_hit_rate"] = {
+        "k": int(effective_top_k),
+        "hit_rate": top_k_hit_rate,
+        "display": f"Top-{effective_top_k}: {top_k_hit_rate:.1%}",
+    }
+
     ml_confidence = proba.max(axis=1)
     ml_prediction = canonicalize_massnahmen(pd.Series(y_pred, name="ml_prediction")).reset_index(drop=True)
     ml_confidence_series = pd.Series(ml_confidence, name="ml_confidence").reset_index(drop=True)
@@ -2133,6 +2166,28 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "actual": y_test.reset_index(drop=True),
         }
     )
+    predictions_df["is_correct"] = predictions_df["final_prediction"].astype(str) == predictions_df["actual"].astype(str)
+    final_conf_numeric = pd.to_numeric(predictions_df["final_confidence"], errors="coerce").fillna(1.0).clip(0.0, 1.0)
+    error_indicator = (~predictions_df["is_correct"]).astype(int).to_numpy(dtype=float)
+    review_scores = (1.0 - final_conf_numeric).to_numpy(dtype=float)
+    predictions_df["review_score"] = review_scores
+
+    if len(predictions_df) > 0:
+        benefit_top_share = compute_cost_simulation(error_indicator, review_scores, review_share, cost_review, cost_miss)
+        benefit_full_review = compute_cost_simulation(error_indicator, review_scores, 1.0, cost_review, cost_miss)
+    else:
+        benefit_top_share = 0.0
+        benefit_full_review = 0.0
+
+    metrics["cost_simulation"] = {
+        "review_share": review_share,
+        "cost_review": cost_review,
+        "cost_miss": cost_miss,
+        "net_benefit_top_share": float(benefit_top_share),
+        "net_benefit_full_review": float(benefit_full_review),
+        "delta_vs_full_review": float(benefit_top_share - benefit_full_review),
+    }
+
     predictions_df["confidence_percent"] = predictions_df["final_confidence"].astype(float, errors="ignore") * 100.0
     predictions_df.sort_values("final_confidence", ascending=False, inplace=True)
     predictions_display = predictions_df.head(50).reset_index(drop=True)
@@ -2142,6 +2197,8 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     ml_fallback_rate = float(rule_source_series.isna().mean()) if not rule_source_series.empty else 0.0
     metrics["rule_coverage"] = rule_coverage
     metrics["ml_fallback_rate"] = ml_fallback_rate
+    metrics["rule_coverage_display"] = f"{rule_coverage:.1%}"
+    metrics["ml_fallback_display"] = f"{ml_fallback_rate:.1%}"
 
     distribution_df = (
         predictions_df["final_prediction"].astype("string").value_counts().rename_axis("Massnahme").reset_index(name="Anzahl")
@@ -2153,10 +2210,34 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     importance_path = tmp_dir / "feature_importance.csv"
     plot_path = tmp_dir / "feature_importance.png"
     predictions_path = tmp_dir / "predictions.csv"
+    heatmap_path = tmp_dir / "confusion_heatmap.png"
 
     joblib.dump(baseline, model_path)
     importance_df.to_csv(importance_path, index=False)
     predictions_df.to_csv(predictions_path, index=False)
+
+    confusion_plot_image = None
+    if confusion.size:
+        fig_width = max(6.0, len(classes) * 0.75)
+        fig_height = max(5.0, len(classes) * 0.6)
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+        im = ax.imshow(confusion, cmap="Blues")
+        ax.set_xticks(np.arange(len(classes)))
+        ax.set_yticks(np.arange(len(classes)))
+        ax.set_xticklabels(classes, rotation=45, ha="right")
+        ax.set_yticklabels(classes)
+        ax.set_xlabel("Vorhergesagt")
+        ax.set_ylabel("Wahr")
+        ax.set_title("Konfusionsmatrix")
+        vmax = confusion.max() if confusion.size else 1
+        for (i, j), val in np.ndenumerate(confusion):
+            color = "white" if val > vmax / 2 else "black"
+            ax.text(j, i, int(val), ha="center", va="center", color=color)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        plt.tight_layout()
+        fig.savefig(heatmap_path, dpi=160)
+        plt.close(fig)
+        confusion_plot_image = str(heatmap_path)
 
     plot_image = None
     if not top20.empty:
@@ -2173,6 +2254,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         **metrics,
         "confusion_matrix": confusion.tolist(),
         "massnahmen_distribution": distribution_df.to_dict(orient="records"),
+        "confusion_heatmap_path": confusion_plot_image,
     }
     metrics_path.write_text(json.dumps(metrics_serializable, indent=2), encoding="utf-8")
 
@@ -2196,6 +2278,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "hybrid_predictor": hybrid_predictor,
             "rule_metrics": {"rule_coverage": rule_coverage, "ml_fallback_rate": ml_fallback_rate},
             "massnahmen_distribution": distribution_df,
+            "confusion_heatmap": confusion_plot_image,
         }
     )
 
@@ -2230,10 +2313,15 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     ml_fallback_display = f"{ml_fallback_rate:.1%}"
     distribution_display = distribution_df.copy()
 
+    status_message = (
+        f"Baseline trainiert – Genauigkeit {metrics['accuracy']:.1%} auf {validation_count} Validierungs-Belegen."
+    )
+
     return (
-        "Baseline trainiert.",
+        status_message,
         metrics,
         confusion_df,
+        confusion_plot_image,
         str(model_path),
         str(metrics_path),
         top20,
@@ -3043,6 +3131,7 @@ def build_interface() -> gr.Blocks:
                         metrics_download = gr.File(label="Metrics JSON", interactive=False)
                     with gr.Accordion("Konfusionsmatrix", open=False):
                         confusion_df = gr.Dataframe(label="Konfusionsmatrix", interactive=False)
+                        confusion_plot = gr.Image(label="Konfusionsmatrix (Heatmap)", interactive=False)
                     model_download = gr.File(label="Baseline Modell", interactive=False)
                     with gr.Accordion("Feature Importances", open=False):
                         importance_table = gr.Dataframe(label="Feature Importances", interactive=False)
@@ -3288,6 +3377,7 @@ def build_interface() -> gr.Blocks:
                 baseline_status,
                 metrics_json,
                 confusion_df,
+                confusion_plot,
                 model_download,
                 metrics_download,
                 importance_table,

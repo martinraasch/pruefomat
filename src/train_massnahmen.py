@@ -151,10 +151,13 @@ def train_massnahmen_cli(args: argparse.Namespace) -> int:
     )
 
     stratify_series = target_series if target_series.nunique(dropna=True) > 1 else None
+    evaluation_cfg = getattr(config, "evaluation", None)
+    validation_size = args.test_size if args.test_size is not None else getattr(evaluation_cfg, "validation_size", 0.25)
+
     X_train, X_test, y_train, y_test = train_test_split(
         features,
         target_series,
-        test_size=args.test_size,
+        test_size=validation_size,
         random_state=args.random_state,
         stratify=stratify_series,
     )
@@ -226,7 +229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sheet", default=0, help="Sheet-Name oder Index")
     parser.add_argument("--config", default="config/default_config.yaml", help="Pfad zur App-Konfiguration")
     parser.add_argument("--output-dir", required=True, help="Zielordner für Artefakte")
-    parser.add_argument("--test-size", type=float, default=0.2, help="Testset-Anteil (0-1)")
+    parser.add_argument("--test-size", type=float, default=None, help="Testset-Anteil (0-1); default aus Konfiguration")
     parser.add_argument("--random-state", type=int, default=42, help="Zufallsseed")
     return parser.parse_args(argv)
 
