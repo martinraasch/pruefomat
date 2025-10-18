@@ -1,25 +1,75 @@
 {
-  "recall": 0.3333333333333333,
-  "precision": 0.16666666666666666,
-  "f2_score": 0.2777777777777778,
-  "balanced_accuracy": 0.3333333333333333,
-  "macro_f1": 0.2222222222222222,
-  "classification_report": "              precision    recall  f1-score   support\n\n           1       0.50      1.00      0.67         3\n           2       0.00      0.00      0.00         2\n           3       0.00      0.00      0.00         1\n\n    accuracy                           0.50         6\n   macro avg       0.17      0.33      0.22         6\nweighted avg       0.25      0.50      0.33         6\n",
+  "accuracy": 1.0,
+  "macro_f1": 1.0,
+  "weighted_f1": 1.0,
+  "classes": [
+    "Rechnungspr\u00fcfung",
+    "Unbekannt"
+  ],
+  "classification_report": {
+    "Rechnungspr\u00fcfung": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 1.0
+    },
+    "Unbekannt": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 0.0
+    },
+    "accuracy": 1.0,
+    "macro avg": {
+      "precision": 0.5,
+      "recall": 0.5,
+      "f1-score": 0.5,
+      "support": 1.0
+    },
+    "weighted avg": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 1.0
+    }
+  },
+  "recall": 1.0,
+  "precision": 1.0,
+  "f2_score": 1.0,
+  "samples": {
+    "train": 2,
+    "validation": 1,
+    "validation_fraction_actual": 0.3333333333333333,
+    "validation_fraction_config": 0.25
+  },
+  "accuracy_display": "In 100% der F\u00e4lle richtig",
+  "top_k_hit_rate": {
+    "k": 2,
+    "hit_rate": 1.0,
+    "display": "Top-2: 100.0%"
+  },
+  "cost_simulation": {
+    "review_share": 0.2,
+    "cost_review": 50.0,
+    "cost_miss": 250.0,
+    "net_benefit_top_share": -50.0,
+    "net_benefit_full_review": -50.0,
+    "delta_vs_full_review": 0.0
+  },
+  "rule_coverage": 1.0,
+  "ml_fallback_rate": 0.0,
+  "rule_coverage_display": "100.0%",
+  "ml_fallback_display": "0.0%",
   "confusion_matrix": [
     [
-      3,
-      0,
-      0
-    ],
-    [
-      2,
-      0,
-      0
-    ],
-    [
-      1,
-      0,
-      0
+      1.0
     ]
-  ]
+  ],
+  "massnahmen_distribution": [
+    {
+      "Massnahme": "Rechnungspr\u00fcfung",
+      "Anzahl": 1
+    }
+  ],
+  "confusion_heatmap_path": "/var/folders/rw/hc_9nsds4_d07jjxnn70v_yh0000gp/T/pruefomat_model_yf037a51/confusion_heatmap.png"
 }

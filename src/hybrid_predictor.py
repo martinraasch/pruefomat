@@ -41,6 +41,8 @@ class HybridMassnahmenPredictor:
         self.label_encoder_ = None
         self._shap_explainer = None
         self._logger = logging.getLogger(__name__)
+        self._last_predict_proba: Optional[np.ndarray] = None
+        self._last_predict_classes: Optional[np.ndarray] = None
 
     def predict(self, X: pd.DataFrame) -> pd.DataFrame:
         """Return DataFrame containing prediction, confidence, and source."""
@@ -50,25 +52,36 @@ class HybridMassnahmenPredictor:
 
         records = []
 
-        for _, row in X.iterrows():
+        for index, row in X.iterrows():
             prediction, confidence, source = self.rule_engine.evaluate(row)
             allowed_classes = getattr(self.rule_engine, "current_allowed_classes", None)
+            restricted = False
 
             if prediction is None:
-                prediction, confidence, restricted = self._run_ml(row, allowed_classes=allowed_classes)
+                prediction, confidence, restricted = self._run_ml(
+                    row,
+                    allowed_classes=allowed_classes,
+                )
                 source = (
-                    f"ml_restricted_{row.get('Ampel', 'unknown')}" if restricted else "ml"
+                    f"ml_restricted_{row.get('Ampel', 'unknown')}"
+                    if restricted
+                    else "ml"
                 )
 
             records.append(
                 {
+                    "row_index": index,
                     "prediction": prediction,
                     "confidence": confidence,
                     "source": source,
                 }
             )
 
-        return pd.DataFrame.from_records(records)
+        if not records:
+            return pd.DataFrame(columns=["prediction", "confidence", "source"])
+
+        frame = pd.DataFrame.from_records(records).set_index("row_index")
+        return frame[["prediction", "confidence", "source"]]
 
     def explain(self, row: pd.Series) -> Dict[str, Any]:
         """Provide per-row explanation for hybrid prediction."""
@@ -98,6 +111,10 @@ class HybridMassnahmenPredictor:
                 "allowed_classes": allowed_classes,
             }
             explanation["details"]["shap_top5"] = self._get_shap_explanation(row)
+            if self._last_predict_proba is not None and self._last_predict_classes is not None:
+                probas = self._last_predict_proba.astype(float)
+                classes = [str(cls) for cls in self._last_predict_classes]
+                explanation["details"]["probabilities"] = dict(zip(classes, probas))
         elif source:
             explanation["details"]["matched_conditions"] = self._get_rule_conditions(source, row)
 
@@ -108,6 +125,8 @@ class HybridMassnahmenPredictor:
     ) -> tuple[str, Optional[float], bool]:
         proba = self.ml_model.predict_proba(row.to_frame().T)[0]
         classes = getattr(self.ml_model, "classes_", None)
+        self._last_predict_proba = np.array(proba, copy=True)
+        self._last_predict_classes = np.array(classes, copy=True) if classes is not None else None
         if classes is None:
             classes = self.ml_model.predict(row.to_frame().T)
             return str(classes[0]), None, False
@@ -184,7 +203,11 @@ class HybridMassnahmenPredictor:
         if explainer is None:
             return None
 
-        shap_values = explainer.shap_values(dense, check_additivity=False)
+        try:
+            shap_values = explainer.shap_values(dense, check_additivity=False)
+        except Exception as exc:  # pragma: no cover - graceful fallback for unsupported estimators
+            self._logger.warning("shap_values_failed", exc_info=exc)
+            return None
         if isinstance(shap_values, list):
             class_index = self._dominant_class_index(sample)
             class_index = max(0, min(class_index, len(shap_values) - 1))
@@ -208,7 +231,11 @@ class HybridMassnahmenPredictor:
         if classifier is None:
             return None
 
-        self._shap_explainer = shap_module.TreeExplainer(classifier, self.background_)
+        try:
+            self._shap_explainer = shap_module.TreeExplainer(classifier, self.background_)
+        except Exception as exc:  # pragma: no cover - defensive guard for unsupported models
+            self._logger.warning("shap_tree_explainer_unavailable", exc_info=exc)
+            self._shap_explainer = None
         return self._shap_explainer
 
     def _get_rule_conditions(self, rule_name: str, row: pd.Series) -> Optional[list[Dict[str, Any]]]:

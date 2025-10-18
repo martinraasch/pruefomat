@@ -79,6 +79,9 @@ def test_hybrid_predictor_explain_ml_path():
     assert explanation["prediction"] == "Gutschrift"
     assert explanation["source"] == "ml"
     assert "shap_top5" in explanation["details"]
+    probs = explanation["details"].get("probabilities")
+    assert probs is not None
+    assert set(probs.keys()) == {"Rechnungsprüfung", "Gutschrift"}
 
 
 def test_hybrid_predictor_explain_ml_restricted():

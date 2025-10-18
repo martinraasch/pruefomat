@@ -11,13 +11,14 @@ from app import (
     DEFAULT_CONFIG_PATH,
     CANONICAL_MASSNAHMEN,
     FEEDBACK_DB_PATH,
-    build_pipeline_action,
     batch_predict_action,
+    build_pipeline_action,
+    export_explanation_action,
     explain_massnahme_action,
-    generate_pattern_report_action,
     feedback_fp_action,
     feedback_report_action,
     feedback_tp_action,
+    generate_pattern_report_action,
     train_baseline_action,
 )
 
@@ -193,36 +194,38 @@ def test_recall_metrics(baseline_state):
 
 
 def test_confidence_scores(baseline_state):
-    _, predictions, _ = baseline_state
+    _, predictions, state = baseline_state
     assert "final_confidence" in predictions
     assert predictions["final_confidence"].between(0, 1).all()
-    assert "review_score" in predictions
-    assert predictions["review_score"].between(0, 1).all()
+    predictions_full = state["predictions_full"]
+    assert "review_score" in predictions_full
+    assert predictions_full["review_score"].between(0, 1).all()
+    assert "explanation" in predictions
 
 
 def test_threshold_application(baseline_state):
-    _, predictions, _ = baseline_state
+    _, predictions, state = baseline_state
     assert "final_prediction" in predictions
     assert predictions["final_prediction"].notna().all()
-    assert "is_correct" in predictions
-    assert set(predictions["is_correct"].unique()).issubset({True, False})
+    full_predictions = state["predictions_full"]
+    assert "is_correct" in full_predictions
+    assert set(full_predictions["is_correct"].unique()).issubset({True, False})
 
 
 def test_shap_explanations(baseline_state):
     _, _, state = baseline_state
     status, explanation, download_path, _ = explain_massnahme_action(state, 0)
 
-    assert "Erklärung generiert" in status
+    assert "Erklärung" in status
     assert isinstance(explanation, str)
+    assert explanation.startswith("# Erklärung für Rechnung")
+    assert "## Begründung" in explanation
     assert Path(download_path).exists()
 
-    if "ML-Prediction:" in explanation:
-        assert "Confidence:" in explanation
-        assert "Top SHAP-Features:" in explanation
-    else:
-        assert "Rule-Based:" in explanation or "Regel:" in explanation
-        assert "Regel:" in explanation
-        assert "Erfüllte Bedingungen:" in explanation
+    # Ensure export uses stored explanation
+    export_status, export_path, _ = export_explanation_action(state)
+    assert "Markdown exportiert" in export_status
+    assert Path(export_path).exists()
 
 
 def test_batch_prediction(tmp_path, baseline_state):

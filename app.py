@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import textwrap
@@ -85,6 +86,7 @@ from src.patterns import (
 )
 from src.business_rules import BusinessRule, load_business_rules_from_file
 from src.rule_engine import RuleEngine
+from src.explanations import create_explanation_components
 from src.hybrid_predictor import HybridMassnahmenPredictor
 from src.train_massnahmen import evaluate_multiclass
 from src.eval_utils import compute_cost_simulation
@@ -434,6 +436,13 @@ def _tooltip_label(text: str, tip: str) -> str:
         "</span>"
         "</div>"
     )
+
+
+def _slugify_label(text: object) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text))
+    ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
+    safe = "".join(ch if ch.isalnum() else "_" for ch in ascii_value.lower())
+    return safe.strip("_") or "massnahme"
 
 
 def _compute_split_params(target: pd.Series, default_test_size: float = 0.2) -> tuple[int, Optional[pd.Series]]:
@@ -2130,47 +2139,43 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         hybrid_predictor.background_ = shap_background
 
     hybrid_results = hybrid_predictor.predict(X_test.reset_index(drop=True))
+    source_series = hybrid_results["source"].astype("string").fillna("ml")
+    rule_source_series = source_series.where(source_series != "ml", None)
+    rule_prediction_series = hybrid_results["prediction"].where(rule_source_series.notna(), None)
+    rule_confidence_series = hybrid_results["confidence"].where(rule_source_series.notna(), None)
 
-    final_prediction = ml_prediction.copy()
+    final_prediction = canonicalize_massnahmen(ml_prediction.copy())
     final_confidence = ml_confidence_series.copy()
-    rule_prediction = []
-    rule_confidence = []
-    applied_rule = []
+    non_ml_mask = rule_source_series.notna()
+    if non_ml_mask.any():
+        final_prediction.loc[non_ml_mask] = hybrid_results.loc[non_ml_mask, "prediction"].to_list()
+        updated_conf = hybrid_results.loc[non_ml_mask, "confidence"].astype(float)
+        final_confidence.loc[non_ml_mask] = updated_conf.values
 
-    for idx, row in hybrid_results.iterrows():
-        source = row.get("source", "ml") or "ml"
-        applied_rule.append(source if source != "ml" else None)
-        rule_prediction.append(row.get("prediction") if source != "ml" else None)
-        conf = row.get("confidence")
-        rule_confidence.append(conf if source != "ml" else None)
-        if source != "ml":
-            final_prediction.iloc[idx] = row.get("prediction", final_prediction.iloc[idx])
-            if conf is not None:
-                try:
-                    final_confidence.iloc[idx] = float(conf)
-                except (TypeError, ValueError):
-                    pass
-
-    final_prediction = canonicalize_massnahmen(final_prediction)
-
-    predictions_df = pd.DataFrame(
-        {
-            "row_index": np.arange(len(final_prediction)),
-            "ml_prediction": ml_prediction,
-            "ml_confidence": ml_confidence_series,
-            "rule_source": applied_rule,
-            "rule_prediction": rule_prediction,
-            "rule_confidence": rule_confidence,
-            "final_prediction": final_prediction,
-            "final_confidence": final_confidence,
-            "actual": y_test.reset_index(drop=True),
-        }
+    result_index = pd.RangeIndex(len(final_prediction))
+    predictions_df = pd.DataFrame(index=result_index)
+    predictions_df["row_index"] = result_index
+    predictions_df["ml_prediction"] = ml_prediction.reset_index(drop=True)
+    predictions_df["ml_confidence"] = ml_confidence_series.reset_index(drop=True)
+    predictions_df["rule_source"] = rule_source_series.reset_index(drop=True)
+    predictions_df["rule_prediction"] = rule_prediction_series.reset_index(drop=True)
+    predictions_df["rule_confidence"] = pd.to_numeric(
+        rule_confidence_series.reset_index(drop=True), errors="coerce"
     )
+    predictions_df["final_prediction"] = final_prediction.reset_index(drop=True)
+    predictions_df["final_confidence"] = final_confidence.reset_index(drop=True)
+    predictions_df["actual"] = y_test.reset_index(drop=True)
     predictions_df["is_correct"] = predictions_df["final_prediction"].astype(str) == predictions_df["actual"].astype(str)
     final_conf_numeric = pd.to_numeric(predictions_df["final_confidence"], errors="coerce").fillna(1.0).clip(0.0, 1.0)
     error_indicator = (~predictions_df["is_correct"]).astype(int).to_numpy(dtype=float)
     review_scores = (1.0 - final_conf_numeric).to_numpy(dtype=float)
     predictions_df["review_score"] = review_scores
+
+    feature_frame = X_test.reset_index(drop=True).copy()
+    feature_columns = list(feature_frame.columns)
+    predictions_df = pd.concat([predictions_df, feature_frame], axis=1)
+
+    predictions_df["explanation"] = "🔍 Erklärung anzeigen"
 
     if len(predictions_df) > 0:
         benefit_top_share = compute_cost_simulation(error_indicator, review_scores, review_share, cost_review, cost_miss)
@@ -2190,11 +2195,22 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
 
     predictions_df["confidence_percent"] = predictions_df["final_confidence"].astype(float, errors="ignore") * 100.0
     predictions_df.sort_values("final_confidence", ascending=False, inplace=True)
-    predictions_display = predictions_df.head(50).reset_index(drop=True)
+    display_columns = [
+        "row_index",
+        "final_prediction",
+        "final_confidence",
+        "ml_prediction",
+        "ml_confidence",
+        "rule_source",
+        "rule_prediction",
+        "actual",
+        "explanation",
+    ]
+    predictions_display = predictions_df[display_columns].head(50).reset_index(drop=True)
 
-    rule_source_series = pd.Series(applied_rule, dtype="object")
-    rule_coverage = float(rule_source_series.notna().mean()) if not rule_source_series.empty else 0.0
-    ml_fallback_rate = float(rule_source_series.isna().mean()) if not rule_source_series.empty else 0.0
+    rule_source_full = predictions_df["rule_source"].astype("object")
+    rule_coverage = float(rule_source_full.notna().mean()) if not rule_source_full.empty else 0.0
+    ml_fallback_rate = float(rule_source_full.isna().mean()) if not rule_source_full.empty else 0.0
     metrics["rule_coverage"] = rule_coverage
     metrics["ml_fallback_rate"] = ml_fallback_rate
     metrics["rule_coverage_display"] = f"{rule_coverage:.1%}"
@@ -2258,6 +2274,25 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
     }
     metrics_path.write_text(json.dumps(metrics_serializable, indent=2), encoding="utf-8")
 
+    outputs_dir = Path("outputs")
+    try:
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(baseline, outputs_dir / "baseline_model.joblib")
+        joblib.dump(label_encoder, outputs_dir / "label_encoder.joblib")
+        predictions_df.to_csv(outputs_dir / "predictions.csv", index=False)
+        importance_df.to_csv(outputs_dir / "feature_importance.csv", index=False)
+        (outputs_dir / "metrics.json").write_text(
+            json.dumps(metrics_serializable, indent=2),
+            encoding="utf-8",
+        )
+        if confusion_plot_image:
+            try:
+                shutil.copy(confusion_plot_image, outputs_dir / "confusion_heatmap.png")
+            except (OSError, shutil.SameFileError):  # pragma: no cover
+                pass
+    except Exception as exc:  # pragma: no cover - best-effort export
+        logger.warning("ui_outputs_export_failed", message=str(exc))
+
     state.update(
         {
             "baseline_model": baseline,
@@ -2279,6 +2314,7 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "rule_metrics": {"rule_coverage": rule_coverage, "ml_fallback_rate": ml_fallback_rate},
             "massnahmen_distribution": distribution_df,
             "confusion_heatmap": confusion_plot_image,
+            "feature_columns": feature_columns,
         }
     )
 
@@ -2339,9 +2375,10 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
 def explain_massnahme_action(state: Optional[Dict[str, Any]], row_index):
     state = state or {}
     hybrid_predictor: Optional[HybridMassnahmenPredictor] = state.get("hybrid_predictor")
-    df_features = state.get("df_features")
+    predictions_df = state.get("predictions_full")
+    feature_columns: Optional[List[str]] = state.get("feature_columns")
 
-    if hybrid_predictor is None or df_features is None:
+    if hybrid_predictor is None or predictions_df is None or predictions_df.empty:
         return "Bitte zuerst Baseline trainieren.", None, None, state
 
     try:
@@ -2349,63 +2386,70 @@ def explain_massnahme_action(state: Optional[Dict[str, Any]], row_index):
     except (TypeError, ValueError):
         return "Ungültiger Index.", None, None, state
 
-    if idx < 0 or idx >= len(df_features):
-        return f"Index muss zwischen 0 und {len(df_features) - 1} liegen.", None, None, state
+    row_match = predictions_df.loc[predictions_df["row_index"] == idx]
+    if row_match.empty:
+        return f"Kein Eintrag für Zeile {idx} gefunden.", None, None, state
 
-    row = df_features.iloc[idx].copy()
-    explanation = hybrid_predictor.explain(row)
-    prediction_label = explanation.get("prediction")
-    source = explanation.get("source", "ml") or "ml"
-    confidence = explanation.get("confidence")
-    confidence_text = f"{confidence:.1%}" if isinstance(confidence, (int, float)) else "n/a"
+    prediction_row = row_match.iloc[0]
 
-    details = explanation.get("details", {})
-    is_ml_prediction = source.startswith("ml")
+    if not feature_columns:
+        excluded = {
+            "row_index",
+            "ml_prediction",
+            "ml_confidence",
+            "rule_source",
+            "rule_prediction",
+            "rule_confidence",
+            "final_prediction",
+            "final_confidence",
+            "actual",
+            "is_correct",
+            "review_score",
+            "confidence_percent",
+            "explanation",
+        }
+        feature_columns = [col for col in predictions_df.columns if col not in excluded]
 
-    if is_ml_prediction:
-        shap_table = _format_shap_table(details.get("shap_top5"))
-        ml_context = details.get("ml_context", {})
-        restriction_block = ""
-        rule_name = ml_context.get("rule")
-        allowed = [str(item) for item in ml_context.get("allowed_classes", []) if item]
-        if rule_name and allowed:
-            verb = "beschränkt" if ml_context.get("restricted") else "definiert"
-            lines = [f"**Hinweis:** Regel `{rule_name}` {verb} die ML-Auswahl auf:"]
-            lines.extend(f"- {label}" for label in allowed)
-            restriction_block = "\n".join(lines)
+    components = create_explanation_components(
+        predictor=hybrid_predictor,
+        row_index=idx,
+        prediction_row=prediction_row,
+        feature_columns=list(feature_columns),
+        predictions_df=predictions_df,
+    )
 
-        parts = [
-            f"### ML-Prediction: {prediction_label}",
-            f"**Confidence:** {confidence_text}",
-        ]
-        if restriction_block:
-            parts.append(restriction_block)
-        parts.extend(
-            [
-                "",
-                "**Top SHAP-Features:**",
-                shap_table,
-            ]
-        )
-        formatted = "\n".join(parts).strip()
-    else:
-        conditions_markdown = _format_conditions(explanation.get("details", {}).get("matched_conditions"))
-        formatted = textwrap.dedent(
-            f"""
-            ### Rule-Based: {prediction_label}
-            **Regel:** {source}
-            **Confidence:** {confidence_text}
+    markdown = components.markdown
+    final_prediction = components.payload.get("prediction")
+    massnahme_slug = _slugify_label(final_prediction or "massnahme")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_erklaerung_"))
+    md_path = tmp_dir / f"erklaerung_beleg_{idx}_{massnahme_slug}.md"
+    md_path.write_text(markdown, encoding="utf-8")
 
-            **Erfüllte Bedingungen:**
-            {conditions_markdown}
-            """
-        ).strip()
+    state["last_explanation_payload"] = components.payload
+    state["last_explanation_markdown"] = markdown
+    state["last_explanation_row_index"] = idx
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_massnahme_"))
-    md_path = tmp_dir / f"explanation_{idx}.md"
-    md_path.write_text(formatted, encoding="utf-8")
+    status_message = f"Erklärung für Beleg #{idx} generiert."
+    return status_message, markdown, str(md_path), state
 
-    return "Erklärung generiert", formatted, str(md_path), state
+
+def export_explanation_action(state: Optional[Dict[str, Any]]):
+    state = state or {}
+    payload = state.get("last_explanation_payload")
+    markdown = state.get("last_explanation_markdown")
+
+    if not payload or not markdown:
+        return "Keine Erklärung vorhanden. Bitte zuerst eine Erklärung anzeigen.", None, state
+
+    row_index = payload.get("row_index", "unbekannt")
+    prediction = payload.get("prediction", "massnahme")
+    massnahme_slug = _slugify_label(prediction)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pruefomat_export_"))
+    md_path = tmp_dir / f"erklaerung_beleg_{row_index}_{massnahme_slug}.md"
+    md_path.write_text(markdown, encoding="utf-8")
+
+    status_message = f"Markdown exportiert ({md_path.name})."
+    return status_message, str(md_path), state
 
 
 def generate_pattern_report_action(state: Optional[Dict[str, Any]]):
@@ -2596,6 +2640,7 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
         "Betrag_parsed",
         "BUK",
         "Debitor",
+        "Land",
         "negativ",
     }
 
@@ -2641,7 +2686,27 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
 
     if hybrid_predictor is not None:
         results = hybrid_predictor.predict(df_input.reset_index(drop=True))
-        df_input["Massnahme_2025"] = canonicalize_massnahmen(results["prediction"]).to_numpy()
+        if not isinstance(results, pd.DataFrame) or "prediction" not in results.columns:
+            fallback_predictions: List[str] = []
+            fallback_confidences: List[Optional[float]] = []
+            fallback_sources: List[str] = []
+            for _, row in df_input.reset_index(drop=True).iterrows():
+                explanation = hybrid_predictor.explain(row)
+                fallback_predictions.append(explanation.get("prediction"))
+                fallback_confidences.append(explanation.get("confidence"))
+                source_value = explanation.get("source", "ml") or "ml"
+                fallback_sources.append(str(source_value))
+            results = pd.DataFrame(
+                {
+                    "prediction": canonicalize_massnahmen(pd.Series(fallback_predictions)).reset_index(drop=True),
+                    "confidence": pd.Series(fallback_confidences, dtype="float"),
+                    "source": pd.Series(fallback_sources, dtype="string"),
+                }
+            )
+        predicted_series = canonicalize_massnahmen(results["prediction"]).reset_index(drop=True)
+        fill_value = predicted_series.iloc[0] if not predicted_series.empty else "Unbekannt"
+        predicted_series = predicted_series.reindex(range(len(df_input)), fill_value=fill_value)
+        df_input["Massnahme_2025"] = predicted_series.to_numpy()
         df_input["final_confidence"] = results["confidence"].astype(float, errors="ignore")
         df_input["prediction_source"] = results["source"]
     else:
@@ -2649,13 +2714,19 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
         raw_predictions = pd.Series(model.predict(df_input), index=df_input.index)
         ml_prediction = canonicalize_massnahmen(raw_predictions).reset_index(drop=True)
         ml_confidence = proba.max(axis=1)
-        df_input["Massnahme_2025"] = ml_prediction.to_numpy()
+        ml_pred_series = ml_prediction.reset_index(drop=True)
+        fill_value = ml_pred_series.iloc[0] if not ml_pred_series.empty else "Unbekannt"
+        ml_pred_series = ml_pred_series.reindex(range(len(df_input)), fill_value=fill_value)
+        df_input["Massnahme_2025"] = ml_pred_series.to_numpy()
         df_input["final_confidence"] = ml_confidence
         df_input["prediction_source"] = "ml"
 
     df_input["final_confidence"] = pd.to_numeric(df_input["final_confidence"], errors="coerce").fillna(0.0)
     df_input["fraud_score"] = df_input["final_confidence"] * 100.0
-    df_input["final_prediction"] = canonicalize_massnahmen(df_input["Massnahme_2025"].astype("string")).to_numpy()
+    final_series = canonicalize_massnahmen(df_input["Massnahme_2025"].astype("string")).reset_index(drop=True)
+    fill_value = final_series.iloc[0] if not final_series.empty else "Unbekannt"
+    final_series = final_series.reindex(range(len(df_input)), fill_value=fill_value)
+    df_input["final_prediction"] = final_series.to_numpy()
 
     df_out = df_input
 
@@ -3177,7 +3248,8 @@ def build_interface() -> gr.Blocks:
                     gr.Markdown("### Einzel-Erklärung")
                     with gr.Row():
                         explain_index = gr.Number(label="Zeilenindex", value=0, precision=0)
-                        explain_btn = gr.Button("Erklärung anzeigen")
+                        explain_btn = gr.Button("🔍 Erklärung anzeigen")
+                        export_md_btn = gr.Button("📄 Als Markdown exportieren")
                     explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
                     rule_explanation = gr.Markdown(label="Erklärung")
                     explain_download = gr.File(label="Erklärungs-Download", interactive=False)
@@ -3396,6 +3468,12 @@ def build_interface() -> gr.Blocks:
             explain_massnahme_action,
             inputs=[state, explain_index],
             outputs=[explain_status, rule_explanation, explain_download, state],
+        )
+
+        export_md_btn.click(
+            export_explanation_action,
+            inputs=[state],
+            outputs=[explain_status, explain_download, state],
         )
 
         report_btn.click(

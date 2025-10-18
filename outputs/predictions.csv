@@ -1,7 +1,2 @@
-fraud_score,prediction,actual
-66.66666666666666,1,1
-61.66666666666667,1,1
-54.333333333333336,1,1
-49.333333333333336,1,2
-41.66666666666667,1,2
-41.333333333333336,1,3
+row_index,ml_prediction,ml_confidence,rule_source,rule_prediction,rule_confidence,final_prediction,final_confidence,actual,is_correct,review_score,Betrag,Ampel,BUK,Debitor,negativ,Belegdatum,Fallig,Hinweise,explanation,confidence_percent
+0,Rechnungsprüfung,0.7266666666666667,niedrig_betrag_gruene_ampel,Rechnungsprüfung,1.0,Rechnungsprüfung,1.0,Rechnungsprüfung,True,0.0,1000,1,A,100,False,2025-01-01,2025-02-01,verdacht,🔍 Erklärung anzeigen,100.0

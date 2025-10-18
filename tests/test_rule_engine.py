@@ -257,3 +257,118 @@ def test_ml_allowed_classes_restriction():
     chosen = result.loc[0, "prediction"]
     normalized = chosen.strip().lower()
     assert normalized == "telefonische rechnungsbestätigung (vorgelagert)"
+
+
+def test_historical_lookup_requires_columns():
+    history = pd.DataFrame({"BUK": ["A"]})
+    engine = RuleEngine([], historical_data=history)
+    assert engine.historical_lookup == {}
+
+
+def test_check_condition_without_conditions_returns_false():
+    rule = BusinessRule(
+        name="empty_simple",
+        priority=1,
+        condition_type="simple",
+        conditions=[],
+        action_field="Massnahme_2025",
+        action_value="Rechnungsprüfung",
+    )
+    engine = RuleEngine([rule])
+    assert engine._check_condition(rule, pd.Series()) is False
+
+
+def test_check_condition_unknown_type_returns_false():
+    rule = BusinessRule(
+        name="unknown_type",
+        priority=1,
+        condition_type="unknown",
+        conditions=[],
+        action_field="Massnahme_2025",
+        action_value="Rechnungsprüfung",
+    )
+    engine = RuleEngine([rule])
+    assert engine._check_condition(rule, pd.Series()) is False
+
+
+def test_coerce_amount_handles_strings_and_invalid_values():
+    engine = RuleEngine([])
+    assert engine._coerce_amount("1.234,50") == 1234.5
+    assert engine._coerce_amount("abc") is None
+    assert engine._coerce_amount(np.nan) is None
+
+
+def test_check_simple_condition_various_operators():
+    engine = RuleEngine([])
+    row = pd.Series({"Ampel": 2, "Betrag_parsed": 100})
+
+    assert engine._check_simple_condition(
+        SimpleCondition("Ampel", RuleOperator.NOT_EQUALS, 1),
+        row,
+    )
+    assert engine._check_simple_condition(
+        SimpleCondition("Betrag_parsed", RuleOperator.LESS_THAN_OR_EQUAL, 100),
+        row,
+    )
+    assert engine._check_simple_condition(
+        SimpleCondition("Betrag_parsed", RuleOperator.GREATER_THAN, 50),
+        row,
+    )
+    assert engine._check_simple_condition(
+        SimpleCondition("Ampel", RuleOperator.IN, [1, 2, 3]),
+        row,
+    )
+    assert engine._check_simple_condition(
+        SimpleCondition("Ampel", RuleOperator.NOT_IN, [3, 4]),
+        row,
+    )
+
+
+def test_compare_numeric_invalid_inputs():
+    assert RuleEngine._compare_numeric("a", "b", lambda a, b: a < b) is False
+
+
+def test_compare_equality_branches():
+    obj = object()
+    assert RuleEngine._compare_equality(obj, obj)
+    assert RuleEngine._compare_equality(np.nan, 1) is False
+    assert RuleEngine._compare_equality("test", "test")
+    assert RuleEngine._compare_equality("5", 5)
+    assert RuleEngine._compare_equality("A", "a")
+
+
+def test_in_collection_variants():
+    assert RuleEngine._in_collection("x", None, True) is False
+    assert RuleEngine._in_collection("x", None, False) is True
+    assert RuleEngine._in_collection("x", "x", True) is True
+    assert RuleEngine._in_collection("x", "x", False) is False
+
+
+def test_check_lookup_condition_edge_cases():
+    engine = RuleEngine([])
+    rule = BusinessRule(
+        name="lookup",
+        priority=1,
+        condition_type="feature_lookup",
+        conditions=[],
+        action_field="Massnahme_2025",
+        action_value="Gutschrift",
+        lookup_keys=[],
+        historical_action="Gutschrift",
+        min_occurrences=1,
+    )
+
+    assert engine._check_lookup_condition(rule, pd.Series({})) is False
+
+    rule.lookup_keys = ["BUK"]
+
+    class BadRow:
+        def get(self, _):
+            raise KeyError("BUK")
+
+    assert engine._check_lookup_condition(rule, BadRow()) is False
+
+    assert engine._check_lookup_condition(rule, pd.Series({"BUK": None})) is False
+
+    engine.historical_lookup = {("A",): {"Gutschrift": 2}}
+    assert engine._check_lookup_condition(rule, pd.Series({"BUK": "A"})) is True
