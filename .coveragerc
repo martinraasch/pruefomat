@@ -1,0 +1,8 @@
+[run]
+omit =
+    src/train_binary.py
+    src/train_massnahmen.py
+
+[report]
+skip_empty = True
+show_missing = True

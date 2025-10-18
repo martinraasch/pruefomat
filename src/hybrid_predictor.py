@@ -11,6 +11,7 @@ import pandas as pd
 from sklearn.pipeline import Pipeline
 
 from .rule_engine import RuleEngine
+from .utils import align_by_length, ensure_1d
 
 
 class HybridMassnahmenPredictor:
@@ -161,36 +162,54 @@ class HybridMassnahmenPredictor:
         except ImportError:  # pragma: no cover - optional dependency
             return None
 
-        if self._shap_explainer is None:
-            classifier = getattr(self.ml_model, "named_steps", {}).get("classifier", None)
-            if classifier is None:
-                return None
-            self._shap_explainer = shap.TreeExplainer(classifier, self.background_)
+        shap_values = self._compute_shap_values(shap, dense, sample)
+        if shap_values is None:
+            return None
 
-        shap_values = self._shap_explainer.shap_values(dense, check_additivity=False)
+        values = ensure_1d(shap_values)
+        feature_names = self._feature_names(row)
+        feature_names, values = align_by_length(feature_names, values)
+
+        pairs = [(name, float(val)) for name, val in zip(feature_names, values)]
+        pairs.sort(key=lambda item: abs(item[1]), reverse=True)
+        return pairs[:top_n]
+
+    def _feature_names(self, row: pd.Series) -> List[str]:
+        if self.feature_names_ is not None:
+            return list(self.feature_names_)
+        return list(row.index)
+
+    def _compute_shap_values(self, shap_module, dense: Any, sample: pd.DataFrame):
+        explainer = self._ensure_shap_explainer(shap_module)
+        if explainer is None:
+            return None
+
+        shap_values = explainer.shap_values(dense, check_additivity=False)
         if isinstance(shap_values, list):
-            try:
-                proba = self.ml_model.predict_proba(sample)
-                class_index = int(np.argmax(proba[0])) if proba.ndim == 2 else 0
-            except Exception:  # pragma: no cover - defensive
-                class_index = 0
+            class_index = self._dominant_class_index(sample)
             class_index = max(0, min(class_index, len(shap_values) - 1))
             shap_values = shap_values[class_index]
+        return shap_values
 
-        values = np.asarray(shap_values).ravel()
+    def _dominant_class_index(self, sample: pd.DataFrame) -> int:
+        try:
+            proba = self.ml_model.predict_proba(sample)
+            if getattr(proba, "ndim", 1) >= 2:
+                return int(np.argmax(proba[0]))
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return 0
 
-        if values.ndim > 1:
-            values = values[0]
+    def _ensure_shap_explainer(self, shap_module):
+        if self._shap_explainer is not None:
+            return self._shap_explainer
 
-        feature_names = list(self.feature_names_) if self.feature_names_ is not None else list(row.index)
+        classifier = getattr(self.ml_model, "named_steps", {}).get("classifier", None)
+        if classifier is None:
+            return None
 
-        min_len = min(len(feature_names), len(values))
-        feature_names = feature_names[:min_len]
-        values = values[:min_len]
-
-        pairs = list(zip(feature_names, values))
-        pairs.sort(key=lambda item: abs(float(item[1])), reverse=True)
-        return pairs[:top_n]
+        self._shap_explainer = shap_module.TreeExplainer(classifier, self.background_)
+        return self._shap_explainer
 
     def _get_rule_conditions(self, rule_name: str, row: pd.Series) -> Optional[list[Dict[str, Any]]]:
         rule = next((rule for rule in self.rule_engine.rules if rule.name == rule_name), None)

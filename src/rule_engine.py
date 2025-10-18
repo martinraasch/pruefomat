@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .business_rules import BusinessRule, RuleOperator, SimpleCondition
+from .utils import ensure_scalar
 
 
 class RuleEngine:
@@ -84,29 +85,8 @@ class RuleEngine:
         return False
 
     @staticmethod
-    def _to_scalar(value: object) -> object:
-        """Convert Series/ndarrays emitted by pandas lookups into plain scalars."""
-
-        if isinstance(value, np.ndarray):
-            if value.size == 0:
-                return None
-            try:
-                return value.item()
-            except ValueError:
-                return value.flat[0]
-
-        if isinstance(value, pd.Series):
-            if value.empty:
-                return None
-            try:
-                return value.item()
-            except ValueError:
-                return value.iloc[0]
-
-        return value
-
-    @staticmethod
     def _coerce_amount(value: object) -> Optional[float]:
+        value = ensure_scalar(value)
         if value is None or (isinstance(value, float) and np.isnan(value)):
             return None
         try:
@@ -118,11 +98,11 @@ class RuleEngine:
             return None
 
     def _check_simple_condition(self, condition: SimpleCondition, row: pd.Series) -> bool:
-        field_value = self._to_scalar(row.get(condition.field))
+        field_value = ensure_scalar(row.get(condition.field))
 
         if (field_value is None or pd.isna(field_value)) and condition.field == "Betrag_parsed":
-            raw_amount = self._to_scalar(row.get("Betrag"))
-            field_value = self._to_scalar(self._coerce_amount(raw_amount))
+            raw_amount = ensure_scalar(row.get("Betrag"))
+            field_value = ensure_scalar(self._coerce_amount(raw_amount))
 
         if field_value is None or pd.isna(field_value):
             return False
