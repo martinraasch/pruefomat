@@ -15,10 +15,11 @@ from app import (
     build_pipeline_action,
     export_explanation_action,
     explain_massnahme_action,
-    feedback_fp_action,
+    feedback_dashboard_action,
     feedback_report_action,
-    feedback_tp_action,
     generate_pattern_report_action,
+    open_feedback_modal_action,
+    submit_feedback_action,
     train_baseline_action,
 )
 
@@ -172,6 +173,12 @@ def baseline_state():
         rule_cov_display,
         ml_fallback_display,
         distribution,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
         updated_state,
     ) = train_baseline_action(state)
     return metrics, predictions, updated_state
@@ -250,10 +257,26 @@ def test_negativ_feature_is_available(baseline_state):
 
 def test_feedback_flow(baseline_state, feedback_db):
     _, predictions, state = baseline_state
-    status, state = feedback_tp_action(state, predictions.iloc[0]["row_index"], "alice", "korrekt")
-    assert "gespeichert" in status
-    status_fp, state = feedback_fp_action(state, predictions.iloc[1]["row_index"], "alice", "falsch")
-    assert "gespeichert" in status_fp
+    target_row = int(predictions.iloc[0]["row_index"])
+    modal_update = open_feedback_modal_action(state, target_row, mode="correct")
+    assert modal_update[0]["visible"]
+
+    submit_result = submit_feedback_action(
+        "alice",
+        predictions.iloc[0]["final_prediction"],
+        "korrekt",
+        state,
+    )
+    status_message = submit_result[1]
+    state = submit_result[-1]
+    assert "gespeichert" in status_message
+
+    summary, trend_df, per_class_df, critical, state = feedback_dashboard_action(state)
+    assert isinstance(summary, str)
+    assert isinstance(critical, str)
+    assert isinstance(trend_df, pd.DataFrame)
+    assert isinstance(per_class_df, pd.DataFrame)
+
     report_status, report_text, report_path, _ = feedback_report_action(state)
     assert isinstance(report_status, str)
     assert Path(report_path).exists()

@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import textwrap
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -149,6 +149,137 @@ COLUMN_CANONICAL_MAP = {
 
 FEEDBACK_DB_PATH = Path(json.loads(os.environ.get("PRUEFOMAT_SETTINGS", "{}")).get("feedback_db", "feedback.db"))
 
+LIVE_SCENARIO_DEFAULT = "Keins"
+
+LIVE_SCENARIOS = {
+    "Szenario A: Niedrig-Betrag-Grün": {
+        "betrag": 15000.0,
+        "ampel": "Grün (1)",
+        "buk": "A",
+        "debitor": "90001",
+        "belegdatum": datetime(2025, 1, 1).date(),
+        "faelligkeit": datetime(2025, 1, 31).date(),
+        "deb_name": "AutoParts GmbH",
+        "hinweise": "Routineprüfung",
+        "negativ": False,
+    },
+    "Szenario B: Hoch-Betrag-Grün": {
+        "betrag": 95000.0,
+        "ampel": "Grün (1)",
+        "buk": "B",
+        "debitor": "90002",
+        "belegdatum": datetime(2025, 2, 10).date(),
+        "faelligkeit": datetime(2025, 3, 12).date(),
+        "deb_name": "Industriebedarf AG",
+        "hinweise": "Großauftrag",
+        "negativ": False,
+    },
+    "Szenario C: Gelbe Ampel": {
+        "betrag": 35000.0,
+        "ampel": "Gelb (2)",
+        "buk": "A",
+        "debitor": "90003",
+        "belegdatum": datetime(2025, 3, 1).date(),
+        "faelligkeit": datetime(2025, 3, 31).date(),
+        "deb_name": "Handelspartner KG",
+        "hinweise": "Lieferverzug",
+        "negativ": False,
+    },
+    "Szenario D: Rote Ampel": {
+        "betrag": 60000.0,
+        "ampel": "Rot (3)",
+        "buk": "C",
+        "debitor": "90004",
+        "belegdatum": datetime(2025, 4, 5).date(),
+        "faelligkeit": datetime(2025, 5, 5).date(),
+        "deb_name": "Risky Supplies Ltd",
+        "hinweise": "Vorherige Mahnungen",
+        "negativ": True,
+    },
+    "Szenario E: Gutschrifts-Historie": {
+        "betrag": 42000.0,
+        "ampel": "Gelb (2)",
+        "buk": "A",
+        "debitor": "100",
+        "belegdatum": datetime(2025, 5, 15).date(),
+        "faelligkeit": datetime(2025, 6, 14).date(),
+        "deb_name": "Bestandskunde",
+        "hinweise": "Historische Gutschriften",
+        "negativ": False,
+    },
+}
+
+
+def _format_amount_input(value: float) -> str:
+    return f"{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def parse_ampel_choice(choice: object) -> Optional[int]:
+    if choice is None:
+        return None
+    if isinstance(choice, (int, float)):
+        return int(choice)
+    text = str(choice)
+    match = re.search(r"(\d+)", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    normalized = text.strip().lower()
+    mapping = {
+        "grün": 1,
+        "gruen": 1,
+        "gelb": 2,
+        "rot": 3,
+    }
+    return mapping.get(normalized)
+
+
+def balance_classes_dataframe(df: pd.DataFrame, target_col: str, seed: Optional[int] = None) -> pd.DataFrame:
+    """Return a DataFrame where all classes in ``target_col`` have equal counts."""
+
+    if target_col not in df.columns:
+        return df
+
+    counts = df[target_col].value_counts(dropna=False)
+    if counts.empty:
+        return df
+
+    max_count = int(counts.max())
+    if max_count <= 1:
+        return df
+
+    rng = np.random.default_rng(seed if seed is not None else 42)
+    balanced_parts = []
+    for _, group in df.groupby(target_col, dropna=False, sort=False):
+        size = len(group)
+        if size == max_count:
+            balanced_parts.append(group)
+            continue
+        random_state = int(rng.integers(0, 1_000_000))
+        sampled = group.sample(max_count, replace=True, random_state=random_state)
+        balanced_parts.append(sampled)
+
+    balanced_df = pd.concat(balanced_parts, ignore_index=True)
+    shuffled = balanced_df.sample(frac=1.0, random_state=int(rng.integers(0, 1_000_000)))
+    return shuffled.reset_index(drop=True)
+
+
+def _default_live_form() -> Dict[str, Any]:
+    today = datetime.utcnow().date()
+    return {
+        "betrag": 25000.0,
+        "ampel": "Gelb (2)",
+        "buk": "A",
+        "debitor": "12345",
+        "belegdatum": today,
+        "faelligkeit": today + timedelta(days=30),
+        "deb_name": "",
+        "hinweise": "",
+        "negativ": False,
+    }
+
 
 def ensure_feedback_db():
     FEEDBACK_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -164,11 +295,73 @@ def ensure_feedback_db():
                 score REAL,
                 prediction INTEGER,
                 feedback TEXT,
-                comment TEXT
+                comment TEXT,
+                actual_label TEXT,
+                predicted_label TEXT,
+                is_correct INTEGER
             )
             """
         )
+        existing_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(feedback)")
+        }
+        optional_columns = {
+            "actual_label": "TEXT",
+            "predicted_label": "TEXT",
+            "is_correct": "INTEGER",
+            "score": "REAL",
+            "comment": "TEXT",
+            "feedback": "TEXT",
+        }
+        for column, definition in optional_columns.items():
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE feedback ADD COLUMN {column} {definition}")
         conn.commit()
+
+
+def save_feedback_to_db(entry: Dict[str, Any]) -> None:
+    ensure_feedback_db()
+    with sqlite3.connect(FEEDBACK_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO feedback (
+                beleg_index,
+                beleg_id,
+                timestamp,
+                user,
+                score,
+                prediction,
+                feedback,
+                comment,
+                actual_label,
+                predicted_label,
+                is_correct
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry.get("beleg_index"),
+                entry.get("beleg_id"),
+                entry.get("timestamp"),
+                entry.get("user"),
+                entry.get("score"),
+                entry.get("prediction"),
+                entry.get("feedback"),
+                entry.get("comment"),
+                entry.get("actual_label"),
+                entry.get("predicted_label"),
+                int(bool(entry.get("is_correct"))),
+            ),
+        )
+        conn.commit()
+
+
+def load_feedback_from_db() -> pd.DataFrame:
+    ensure_feedback_db()
+    with sqlite3.connect(FEEDBACK_DB_PATH) as conn:
+        df = pd.read_sql_query("SELECT * FROM feedback", conn, parse_dates=["timestamp"])
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    return df
 
 # ---------------------------------------------------------------------------
 # Configuration setup
@@ -238,7 +431,13 @@ TRAINING_STATE_KEYS = {
     "historical_training_data",
 }
 
-SYNTH_STATE_KEYS = {"last_generated_path", "last_quality_path", "bias_rules_yaml"}
+SYNTH_STATE_KEYS = {
+    "last_generated_path",
+    "last_quality_path",
+    "bias_rules_yaml",
+    "synthetic_balanced",
+    "synthetic_balance_requested",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1720,10 +1919,12 @@ def generate_synthetic_data_action(
     gpt_model,
     gpt_key,
     gpt_enabled,
+    balance_classes,
     debug_enabled,
     state: Optional[Dict[str, Any]],
 ):
     state = state or {}
+    balance_classes = bool(balance_classes)
     log_capture: list[str] = []
 
     class _SynthLogHandler(logging.Handler):
@@ -1919,18 +2120,51 @@ def generate_synthetic_data_action(
         log_capture.append("WARN Kein Ausgabepfad erzeugt")
         return "Generatorlauf ohne Ergebnis – bitte prüfen.", None, None, None, "\n".join(log_capture), state
 
+    df_generated: Optional[pd.DataFrame] = None
     try:
-        preview_df = pd.read_excel(output_path).head(20)
+        df_generated = pd.read_excel(output_path)
+        preview_df = df_generated.head(20)
     except Exception:
         preview_df = None
 
+    balance_applied = False
+    balance_warning: Optional[str] = None
+    state["synthetic_balance_requested"] = bool(balance_classes)
+
+    if balance_classes:
+        config_obj = _ensure_config(state)
+        target_column = getattr(config_obj.data, "target_col", None) or "Massnahme_2025"
+        if df_generated is None:
+            try:
+                df_generated = pd.read_excel(output_path)
+            except Exception as exc:
+                balance_warning = f"Ausgabe konnte nicht geladen werden: {exc}"
+        if df_generated is not None:
+            if target_column in df_generated.columns:
+                df_balanced = balance_classes_dataframe(df_generated, target_column, seed_val)
+                try:
+                    df_balanced.to_excel(output_path, index=False)
+                    preview_df = df_balanced.head(20)
+                    df_generated = df_balanced
+                    balance_applied = True
+                except Exception as exc:  # pragma: no cover - unexpected I/O issue
+                    balance_warning = f"Balancing konnte nicht gespeichert werden: {exc}"
+            else:
+                balance_warning = f"Zielspalte '{target_column}' nicht im Output gefunden – Balancing übersprungen."
+
     status = f"Synthetische Daten erzeugt: {output_path.name}"
+    if balance_applied:
+        status += " | Klassen balanciert"
     if quality_path.exists():
         status += f" | Quality Report: {quality_path.name}"
+
+    if balance_warning:
+        log_capture.append("WARN " + balance_warning)
 
     state["last_generated_path"] = str(output_path)
     if quality_path.exists():
         state["last_quality_path"] = str(quality_path)
+    state["synthetic_balanced"] = balance_applied
 
     synth_file = str(output_path)
     quality_file = str(quality_path) if quality_path.exists() else None
@@ -2315,6 +2549,8 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
             "massnahmen_distribution": distribution_df,
             "confusion_heatmap": confusion_plot_image,
             "feature_columns": feature_columns,
+            "validation_features": X_test.reset_index(drop=True),
+            "validation_labels": y_test.reset_index(drop=True),
         }
     )
 
@@ -2353,6 +2589,10 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         f"Baseline trainiert – Genauigkeit {metrics['accuracy']:.1%} auf {validation_count} Validierungs-Belegen."
     )
 
+    feedback_summary_text, feedback_trend_df, feedback_per_class_df, feedback_critical_text, state = feedback_dashboard_action(state)
+    retrain_status_value = ""
+    retrain_comparison_value = pd.DataFrame()
+
     return (
         status_message,
         metrics,
@@ -2368,6 +2608,12 @@ def train_baseline_action(state: Optional[Dict[str, Any]]):
         rule_coverage_display,
         ml_fallback_display,
         distribution_display,
+        feedback_summary_text,
+        feedback_trend_df,
+        feedback_per_class_df,
+        feedback_critical_text,
+        retrain_status_value,
+        retrain_comparison_value,
         state,
     )
 
@@ -2746,63 +2992,60 @@ def batch_predict_action(upload, state: Optional[Dict[str, Any]]):
     return status, str(out_path)
 
 
-def record_feedback(state: Dict[str, Any], row_index: int, feedback: str, user: str, comment: str) -> str:
-    ensure_feedback_db()
+def record_feedback_entry(
+    state: Dict[str, Any],
+    row_index: int,
+    actual_label: Optional[str],
+    user: str,
+    comment: str,
+    feedback_flag: str,
+) -> str:
     predictions = state.get("predictions_full")
-    df_features = state.get("df_features")
-    label_encoder = state.get("label_encoder")
-    if predictions is None or df_features is None:
+    if predictions is None or predictions.empty:
         return "Keine Predictions verfügbar."
 
-    if row_index < 0 or row_index >= len(predictions):
-        return "Index außerhalb gültiger Grenzen."
+    row_match = predictions.loc[predictions["row_index"] == row_index]
+    if row_match.empty:
+        return f"Kein Eintrag für Zeile {row_index} gefunden."
 
-    row = predictions.iloc[row_index]
-    df_row = df_features.iloc[row_index]
-    beleg_id = df_row.get("Rechnungsnummer") if isinstance(df_row, pd.Series) else None
+    row = row_match.iloc[0]
 
-    final_prediction = row.get("final_prediction")
-    final_confidence = float(row.get("final_confidence", 0.0)) if row.get("final_confidence") is not None else 0.0
-    prediction_code: int
-    if label_encoder is not None and final_prediction is not None:
+    predicted_label = str(row.get("final_prediction", "Unbekannt"))
+    actual_label = str(actual_label or predicted_label)
+    is_correct = predicted_label == actual_label
+    final_confidence = row.get("final_confidence")
+    score = float(final_confidence) * 100.0 if final_confidence is not None else 0.0
+
+    label_encoder = state.get("label_encoder")
+    prediction_code = None
+    if label_encoder is not None and predicted_label:
         try:
-            prediction_code = int(label_encoder.transform([str(final_prediction)])[0])
+            prediction_code = int(label_encoder.transform([predicted_label])[0])
         except Exception:  # pragma: no cover - defensive
-            prediction_code = 0
-    else:
-        prediction_code = 0
+            prediction_code = None
 
-    with sqlite3.connect(FEEDBACK_DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO feedback (beleg_index, beleg_id, timestamp, user, score, prediction, feedback, comment)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(row_index),
-                None if pd.isna(beleg_id) else str(beleg_id),
-                datetime.utcnow().isoformat(),
-                user or "unknown",
-                float(final_confidence * 100.0),
-                prediction_code,
-                feedback,
-                comment or "",
-            ),
-        )
-        conn.commit()
+    beleg_id = None
+    for candidate in ("Rechnungsnummer", "Belegnummer", "belegnummer", "invoice_id"):
+        if candidate in row.index and not pd.isna(row.get(candidate)):
+            beleg_id = str(row.get(candidate))
+            break
 
-    return "Feedback gespeichert."
+    entry = {
+        "beleg_index": int(row_index),
+        "beleg_id": beleg_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "user": user or "Unbekannt",
+        "score": score,
+        "prediction": prediction_code,
+        "feedback": feedback_flag,
+        "comment": comment or "",
+        "actual_label": actual_label,
+        "predicted_label": predicted_label,
+        "is_correct": is_correct,
+    }
 
-
-def feedback_action(state: Optional[Dict[str, Any]], row_index, user, comment, label):
-    state = state or {}
-    try:
-        idx = int(row_index)
-    except (TypeError, ValueError):
-        return "Ungültiger Index.", state
-
-    message = record_feedback(state, idx, label, user or "unknown", comment)
-    return message, state
+    save_feedback_to_db(entry)
+    return "✅ Feedback gespeichert. Danke!"
 
 
 def feedback_report_action(state: Optional[Dict[str, Any]]):
@@ -2852,14 +3095,598 @@ def feedback_report_action(state: Optional[Dict[str, Any]]):
     return summary, preview_df, str(md_path), state
 
 
-def feedback_tp_action(state, row_index, user, comment):
-    return feedback_action(state, row_index, user, comment, "TP")
+def feedback_dashboard_action(state: Optional[Dict[str, Any]]):
+    state = state or {}
+    df = load_feedback_from_db()
+    if df.empty:
+        summary = "Noch kein Feedback erfasst."
+        trend_df = pd.DataFrame({"week": [], "accuracy": [], "feedbacks": []})
+        per_class_df = pd.DataFrame({"Maßnahme": [], "Anzahl": [], "Korrekt": []})
+        critical = "Keine kritischen Maßnahmen erkannt."
+    else:
+        df["is_correct"] = df["is_correct"].fillna(0).astype(int)
+        total = int(len(df))
+        correct = int(df["is_correct"].sum())
+        incorrect = total - correct
+        correct_share = correct / total if total else 0
+        incorrect_share = incorrect / total if total else 0
+        summary = (
+            "🎯 Gesamt-Zustimmung: {total} Feedbacks\n"
+            "- {correct_share:.0%} Korrekt ({correct})\n"
+            "- {incorrect_share:.0%} Korrigiert ({incorrect})"
+        ).format(
+            total=total,
+            correct_share=correct_share,
+            correct=correct,
+            incorrect_share=incorrect_share,
+            incorrect=incorrect,
+        )
+
+        if "timestamp" in df.columns and not df["timestamp"].isna().all():
+            weeks = (
+                df["timestamp"].dt.to_period("W").dt.start_time.dt.date
+            )
+            df_weeks = pd.DataFrame({"week": weeks, "is_correct": df["is_correct"]})
+            trend_df = (
+                df_weeks.groupby("week")
+                .agg(accuracy=("is_correct", "mean"), feedbacks=("is_correct", "count"))
+                .reset_index()
+            )
+            trend_df["accuracy"] = trend_df["accuracy"].astype(float)
+        else:
+            trend_df = pd.DataFrame({"week": [], "accuracy": [], "feedbacks": []})
+
+        group = (
+            df.groupby("predicted_label")
+            .agg(
+                accuracy=("is_correct", "mean"),
+                feedbacks=("is_correct", "count"),
+                correct=("is_correct", "sum"),
+            )
+            .reset_index()
+        )
+        group["accuracy"] = group["accuracy"].astype(float)
+        per_class_df = pd.DataFrame(
+            {
+                "Maßnahme": group["predicted_label"].fillna("Unbekannt"),
+                "Anzahl": group["feedbacks"].astype(int),
+                "Korrekt": (group["accuracy"] * 100).round(1),
+            }
+        )
+
+        critical_rows = group[group["accuracy"] < 0.8]
+        if critical_rows.empty:
+            critical = "Keine kritischen Maßnahmen erkannt."
+        else:
+            critical_lines = ["🚨 Kritische Maßnahmen (< 80% Korrekt):"]
+            for _, item in critical_rows.iterrows():
+                correct_count = int(item["correct"])
+                total_count = int(item["feedbacks"])
+                critical_lines.append(
+                    f"• {item['predicted_label']}: {item['accuracy']:.0%} ({correct_count}/{total_count})"
+                )
+            critical = "\n".join(critical_lines)
+
+    state["feedback_cache"] = df
+    return summary, trend_df, per_class_df, critical, state
 
 
-def feedback_fp_action(state, row_index, user, comment):
-    return feedback_action(state, row_index, user, comment, "FP")
+def open_feedback_modal_action(state: Optional[Dict[str, Any]], row_index, mode: str):
+    state = state or {}
+    predictions = state.get("predictions_full")
+    try:
+        idx = int(row_index)
+    except (TypeError, ValueError):
+        return (
+            gr.update(visible=False),
+            "Bitte eine gültige Rechnungsnummer angeben.",
+            gr.update(),
+            gr.update(value=""),
+            gr.update(value=state.get("last_feedback_user", "Workshop Gast")),
+            "",
+            state,
+        )
+
+    if predictions is None or predictions.empty:
+        return (
+            gr.update(visible=False),
+            "Bitte zuerst das Modell trainieren und Predictions erzeugen.",
+            gr.update(),
+            gr.update(value=""),
+            gr.update(value=state.get("last_feedback_user", "Workshop Gast")),
+            "",
+            state,
+        )
+
+    match = predictions.loc[predictions["row_index"] == idx]
+    if match.empty:
+        return (
+            gr.update(visible=False),
+            f"Kein Eintrag für Rechnung #{idx} vorhanden.",
+            gr.update(),
+            gr.update(value=""),
+            gr.update(value=state.get("last_feedback_user", "Workshop Gast")),
+            "",
+            state,
+        )
+
+    row = match.iloc[0]
+    predicted_label = str(row.get("final_prediction", "Unbekannt"))
+    title = textwrap.dedent(
+        f"""
+        ### Feedback für Rechnung #{idx}
+
+        Empfohlen: **{predicted_label}**
+        """
+    ).strip()
+
+    default_actual = predicted_label
+    state["feedback_dialog"] = {
+        "row_index": idx,
+        "mode": mode,
+        "predicted": predicted_label,
+    }
+
+    status = "Bitte tatsächliche Maßnahme auswählen." if mode == "incorrect" else "Bestätige die vorgeschlagene Maßnahme."
+    return (
+        gr.update(visible=True),
+        title,
+        gr.update(value=default_actual),
+        gr.update(value=""),
+        gr.update(value=state.get("last_feedback_user", "Workshop Gast")),
+        status,
+        state,
+    )
 
 
+def cancel_feedback_modal_action(state: Optional[Dict[str, Any]]):
+    state = state or {}
+    state.pop("feedback_dialog", None)
+    return gr.update(visible=False), "Feedback verworfen.", state
+
+
+def submit_feedback_action(user: str, actual_label: str, comment: str, state: Optional[Dict[str, Any]], progress=gr.Progress()):
+    state = state or {}
+    dialog = state.get("feedback_dialog")
+    if not dialog:
+        summary, trend_df, per_class_df, critical, state = feedback_dashboard_action(state)
+        return (
+            gr.update(visible=False),
+            "Kein Feedback-Kontext aktiv.",
+            summary,
+            trend_df,
+            per_class_df,
+            critical,
+            state,
+        )
+
+    progress(0.2, desc="Speichere Feedback")
+    mode = dialog.get("mode", "correct")
+    flag = "correct" if mode == "correct" else "incorrect"
+    row_index = dialog.get("row_index")
+
+    message = record_feedback_entry(
+        state,
+        row_index=row_index,
+        actual_label=actual_label,
+        user=user or "Workshop Gast",
+        comment=comment,
+        feedback_flag=flag,
+    )
+    state["last_feedback_user"] = user or "Workshop Gast"
+    state.pop("feedback_dialog", None)
+
+    progress(0.6, desc="Aktualisiere Dashboard")
+    summary, trend_df, per_class_df, critical, state = feedback_dashboard_action(state)
+    progress(1.0, desc="Fertig")
+
+    return (
+        gr.update(visible=False),
+        message,
+        summary,
+        trend_df,
+        per_class_df,
+        critical,
+        state,
+    )
+
+
+def prepare_feedback_features(state: Dict[str, Any], feedback_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    predictions = state.get("predictions_full")
+    feature_columns = state.get("feature_columns")
+    if predictions is None or feature_columns is None:
+        return pd.DataFrame(), pd.Series(dtype="object")
+
+    merged = feedback_df.merge(
+        predictions,
+        left_on="beleg_index",
+        right_on="row_index",
+        how="inner",
+    )
+    if merged.empty:
+        return pd.DataFrame(), pd.Series(dtype="object")
+
+    features = merged[feature_columns].copy()
+    labels = merged["actual_label"].fillna(merged["predicted_label"]).astype(str)
+    return features.reset_index(drop=True), labels.reset_index(drop=True)
+
+
+def _evaluate_hybrid_predictor(
+    predictor: HybridMassnahmenPredictor,
+    X: pd.DataFrame,
+    y_true: pd.Series,
+    top_k: int = 3,
+) -> Dict[str, float]:
+    if predictor is None or X is None or y_true is None:
+        return {"accuracy": float("nan"), "rule_coverage": float("nan"), "top_k": float("nan")}
+
+    hybrid_results = predictor.predict(X)
+    predictions = hybrid_results["prediction"].astype(str)
+    truth = pd.Series(y_true).astype(str)
+    accuracy = float((predictions == truth).mean()) if len(predictions) else float("nan")
+    rule_coverage = float((hybrid_results["source"].astype(str) != "ml").mean()) if len(hybrid_results) else float("nan")
+
+    try:
+        proba = predictor.ml_model.predict_proba(X)
+        classes = getattr(predictor.ml_model, "classes_", None)
+        if classes is None:
+            top_k_rate = float("nan")
+        else:
+            class_index = {cls: idx for idx, cls in enumerate(classes)}
+            hits: list[bool] = []
+            for row_idx, label in enumerate(truth):
+                true_idx = class_index.get(label)
+                if true_idx is None:
+                    hits.append(False)
+                    continue
+                ranked = np.argsort(proba[row_idx])[::-1][:top_k]
+                hits.append(true_idx in ranked)
+            top_k_rate = float(np.mean(hits)) if hits else float("nan")
+    except Exception:  # pragma: no cover - defensive
+        top_k_rate = float("nan")
+
+    return {
+        "accuracy": accuracy,
+        "rule_coverage": rule_coverage,
+        "top_k": top_k_rate,
+    }
+
+
+def retrain_with_feedback_action(state: Optional[Dict[str, Any]], progress=gr.Progress()):
+    state = state or {}
+    feedback_df = load_feedback_from_db()
+    if len(feedback_df) < 50:
+        return (f"⚠️ Nur {len(feedback_df)} Feedbacks vorhanden. Mindestens 50 werden empfohlen.", pd.DataFrame(), state)
+
+    original_features = state.get("df_features_full")
+    original_target = state.get("target")
+    feature_plan: FeaturePlan | None = state.get("feature_plan")
+    if original_features is None or original_target is None or feature_plan is None:
+        return ("⚠️ Trainingsdaten oder Pipeline-Konfiguration fehlen.", pd.DataFrame(), state)
+
+    progress(0.1, desc="Bereite Trainingsdaten vor")
+    config = _ensure_config(state)
+    rf_kwargs = config.model.random_forest.model_dump(exclude_none=True)
+    ml_classifier = RandomForestClassifier(**rf_kwargs)
+    preprocessor = build_preprocessor(feature_plan, config)
+
+    train_count = min(500, len(original_features))
+    if train_count < 2:
+        return ("⚠️ Zu wenige Trainingsdaten für den Demo-Modus.", pd.DataFrame(), state)
+
+    X_train_small, _, y_train_small, _ = train_test_split(
+        original_features,
+        original_target,
+        train_size=train_count,
+        random_state=config.model.random_forest.random_state,
+        stratify=original_target if original_target.nunique() > 1 else None,
+    )
+
+    X_feedback, y_feedback = prepare_feedback_features(state, feedback_df)
+    if X_feedback.empty:
+        return ("⚠️ Feedback konnte nicht den Predictions zugeordnet werden.", pd.DataFrame(), state)
+
+    progress(0.35, desc="Kombiniere Trainingsdaten")
+    X_combined = pd.concat([X_train_small.reset_index(drop=True), X_feedback], ignore_index=True)
+    y_combined = pd.concat([y_train_small.reset_index(drop=True), y_feedback], ignore_index=True)
+
+    progress(0.55, desc="Trainiere neues Modell")
+    new_model = Pipeline([
+        ("preprocessor", preprocessor),
+        ("classifier", ml_classifier),
+    ])
+    new_model.fit(X_combined, y_combined)
+
+    rule_engine: RuleEngine | None = state.get("rule_engine")
+    if rule_engine is None:
+        return ("⚠️ Regel-Engine nicht verfügbar.", pd.DataFrame(), state)
+
+    new_predictor = HybridMassnahmenPredictor(new_model, rule_engine)
+    new_predictor.preprocessor_ = new_model.named_steps["preprocessor"]
+    new_predictor.feature_names_ = list(state.get("shap_feature_names", [])) or list(X_combined.columns)
+    new_predictor.background_ = state.get("shap_background")
+    new_predictor.label_encoder_ = state.get("label_encoder")
+
+    old_predictor: Optional[HybridMassnahmenPredictor] = state.get("hybrid_predictor")
+    validation_features = state.get("validation_features")
+    validation_labels = state.get("validation_labels")
+    if validation_features is None or validation_labels is None or old_predictor is None:
+        return ("⚠️ Validierungsdaten fehlen für den Vergleich.", pd.DataFrame(), state)
+
+    progress(0.75, desc="Evaluiere Modelle")
+    old_metrics = _evaluate_hybrid_predictor(old_predictor, validation_features, validation_labels)
+    new_metrics = _evaluate_hybrid_predictor(new_predictor, validation_features, validation_labels)
+
+    comparison_df = pd.DataFrame(
+        [
+            {
+                "Metrik": "Gesamt-Genauigkeit",
+                "Vorher": f"{old_metrics['accuracy']:.1%}",
+                "Nachher": f"{new_metrics['accuracy']:.1%}",
+                "Änderung": f"{(new_metrics['accuracy'] - old_metrics['accuracy']):+.1%}",
+            },
+            {
+                "Metrik": "Regel-Abdeckung",
+                "Vorher": f"{old_metrics['rule_coverage']:.1%}",
+                "Nachher": f"{new_metrics['rule_coverage']:.1%}",
+                "Änderung": f"{(new_metrics['rule_coverage'] - old_metrics['rule_coverage']):+.1%}",
+            },
+            {
+                "Metrik": "Top-3-Quote",
+                "Vorher": f"{old_metrics['top_k']:.1%}",
+                "Nachher": f"{new_metrics['top_k']:.1%}",
+                "Änderung": f"{(new_metrics['top_k'] - old_metrics['top_k']):+.1%}",
+            },
+            {
+                "Metrik": "Neue Labels",
+                "Vorher": "-",
+                "Nachher": str(len(y_feedback)),
+                "Änderung": "-",
+            },
+        ]
+    )
+
+    progress(0.9, desc="Speichere Modell")
+    state["hybrid_predictor"] = new_predictor
+    state["baseline_model"] = new_model
+    state["model_version"] = state.get("model_version", 1) + 1
+
+    summary = textwrap.dedent(
+        f"""
+        ✅ Retraining abgeschlossen!
+
+        📊 {len(feedback_df)} neue Labels integriert
+        🎯 Genauigkeit: {old_metrics['accuracy']:.1%} → {new_metrics['accuracy']:.1%}
+        """
+    ).strip()
+
+    progress(1.0, desc="Fertig")
+    return summary, comparison_df, state
+
+
+def _format_date_input(value: object) -> Optional[str]:
+    if value in (None, "", pd.NA):
+        return None
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    return str(value)
+
+
+def prepare_live_invoice(state: Dict[str, Any], form_values: Dict[str, Any]) -> pd.DataFrame:
+    amount_value = float(form_values.get("betrag", 0.0))
+    amount_formatted = _format_amount_input(amount_value)
+    ampel_value = parse_ampel_choice(form_values.get("ampel"))
+
+    record: Dict[str, Any] = {
+        "Betrag": amount_formatted,
+        "Betrag_parsed": amount_value,
+        "Ampel": ampel_value,
+        "BUK": form_values.get("buk") or None,
+        "Debitor": form_values.get("debitor") or None,
+        "Belegdatum": _format_date_input(form_values.get("belegdatum")),
+        "Faellig": _format_date_input(form_values.get("faelligkeit")),
+        "DEB_Name": form_values.get("deb_name") or None,
+        "Hinweise": form_values.get("hinweise") or None,
+        "negativ": bool(form_values.get("negativ", False)),
+    }
+
+    df = pd.DataFrame([record])
+
+    template = state.get("df_features_full")
+    if isinstance(template, pd.DataFrame):
+        for column in template.columns:
+            if column not in df.columns:
+                df[column] = pd.NA
+
+    selected_columns = state.get("selected_columns") or []
+    for column in selected_columns:
+        if column not in df.columns:
+            df[column] = pd.NA
+
+    ordered_columns: List[str] = []
+    if selected_columns:
+        ordered_columns.extend(selected_columns)
+    for column in df.columns:
+        if column not in ordered_columns:
+            ordered_columns.append(column)
+
+    return df[ordered_columns]
+
+
+def _build_live_result_markdown(reason_payload: Dict[str, Any], warnings: List[str]) -> str:
+    prediction = reason_payload.get("prediction", "Unbekannt")
+    confidence_text = reason_payload.get("confidence_text", "n/a")
+    reason_block = reason_payload.get("reason_block", "")
+
+    lines = [
+        "### ✅ Empfohlene Maßnahme",
+        f"**{prediction}**",
+        "",
+        f"🎯 Konfidenz: {confidence_text}",
+    ]
+
+    if reason_block:
+        lines.extend(["", "💡 Begründung:", "", reason_block])
+
+    if warnings:
+        lines.append("")
+        lines.extend(warnings)
+
+    return "\n".join(lines)
+
+
+def load_scenario_action(scenario_name: str, state: Optional[Dict[str, Any]] = None):
+    state = state or {}
+    defaults = _default_live_form()
+    scenario = LIVE_SCENARIOS.get(scenario_name)
+    if scenario is None:
+        scenario = defaults
+
+    updates = []
+    updates.append(gr.update(value=scenario.get("betrag", defaults["betrag"])))
+    updates.append(gr.update(value=scenario.get("ampel", defaults["ampel"])))
+    updates.append(gr.update(value=scenario.get("buk", defaults["buk"])))
+    updates.append(gr.update(value=scenario.get("debitor", defaults["debitor"])))
+    updates.append(gr.update(value=scenario.get("belegdatum", defaults["belegdatum"])))
+    updates.append(gr.update(value=scenario.get("faelligkeit", defaults["faelligkeit"])))
+    updates.append(gr.update(value=scenario.get("deb_name", defaults["deb_name"])))
+    updates.append(gr.update(value=scenario.get("hinweise", defaults["hinweise"])))
+    updates.append(gr.update(value=bool(scenario.get("negativ", defaults["negativ"]))))
+    return tuple(updates)
+
+
+def reset_live_form(state: Optional[Dict[str, Any]] = None):
+    return load_scenario_action(LIVE_SCENARIO_DEFAULT, state)
+
+
+def reset_live_form_action(state: Optional[Dict[str, Any]] = None):
+    field_updates = reset_live_form(state)
+    updates: List[Any] = [gr.update(value=LIVE_SCENARIO_DEFAULT)]
+    updates.extend(field_updates)
+    updates.append(gr.update(value=""))  # live_result_status
+    updates.append(gr.update(value=""))  # live_result_explanation
+    updates.append(gr.update(value=""))  # live_export_status
+    updates.append(gr.update(value=None))  # live_export_download
+    return tuple(updates)
+
+
+def predict_live_action(
+    betrag: float,
+    ampel: object,
+    buk: str,
+    debitor: str,
+    belegdatum,
+    faelligkeit,
+    deb_name: str,
+    hinweise: str,
+    negativ: bool,
+    state: Optional[Dict[str, Any]],
+    progress=gr.Progress(),
+):
+    state = state or {}
+    predictor: Optional[HybridMassnahmenPredictor] = state.get("hybrid_predictor")
+    if predictor is None:
+        return "❌ Bitte zuerst ein Modell trainieren (Tab 'Training & Analyse').", "", "", state
+
+    try:
+        amount_value = float(betrag)
+    except (TypeError, ValueError):
+        return "❌ Fehler: Betrag muss angegeben werden.", "", "", state
+
+    if amount_value <= 0:
+        return "❌ Fehler: Betrag muss positiv sein.", "", "", state
+
+    warnings: List[str] = []
+    if amount_value > 1_000_000:
+        warnings.append("⚠️ Sehr hoher Betrag, bitte prüfen.")
+
+    ampel_value = parse_ampel_choice(ampel)
+    if ampel_value is None:
+        return "❌ Fehler: Ampel-Auswahl ist ungültig.", "", "", state
+
+    if not buk or not str(buk).strip() or not debitor or not str(debitor).strip():
+        return "❌ Fehler: BUK und Debitor sind Pflichtfelder.", "", "", state
+
+    beleg_date_obj = belegdatum
+    faellig_date_obj = faelligkeit
+    if isinstance(beleg_date_obj, str) and beleg_date_obj:
+        try:
+            beleg_date_obj = datetime.strptime(beleg_date_obj, "%Y-%m-%d").date()
+        except ValueError:
+            try:
+                beleg_date_obj = datetime.strptime(beleg_date_obj, "%d.%m.%Y").date()
+            except ValueError:
+                beleg_date_obj = None
+    if isinstance(faellig_date_obj, str) and faellig_date_obj:
+        try:
+            faellig_date_obj = datetime.strptime(faellig_date_obj, "%Y-%m-%d").date()
+        except ValueError:
+            try:
+                faellig_date_obj = datetime.strptime(faellig_date_obj, "%d.%m.%Y").date()
+            except ValueError:
+                faellig_date_obj = None
+
+    if isinstance(beleg_date_obj, date) and isinstance(faellig_date_obj, date):
+        if faellig_date_obj < beleg_date_obj:
+            warnings.append("⚠️ Fälligkeitsdatum liegt vor dem Belegdatum.")
+
+    progress(0.2, desc="Bereite Eingabe vor...")
+    form_values = {
+        "betrag": amount_value,
+        "ampel": ampel,
+        "buk": buk,
+        "debitor": debitor,
+        "belegdatum": beleg_date_obj,
+        "faelligkeit": faellig_date_obj,
+        "deb_name": deb_name,
+        "hinweise": hinweise,
+        "negativ": negativ,
+    }
+    invoice_df = prepare_live_invoice(state, form_values)
+
+    progress(0.5, desc="Führe Prediction aus...")
+    results = predictor.predict(invoice_df)
+    if results.empty:
+        return "❌ Prediction fehlgeschlagen – keine Ausgabe erhalten.", "", "", state
+
+    row_prediction = results.iloc[0]
+    explanation = predictor.explain(invoice_df.iloc[0])
+
+    rule_source = row_prediction.get("source")
+    rule_confidence = row_prediction.get("confidence") if rule_source and str(rule_source) != "ml" else None
+
+    prediction_row = pd.Series(
+        {
+            "row_index": 0,
+            "final_prediction": row_prediction.get("prediction"),
+            "final_confidence": row_prediction.get("confidence"),
+            "rule_source": rule_source,
+            "rule_prediction": explanation.get("prediction") if rule_source else None,
+            "rule_confidence": rule_confidence,
+        }
+    )
+    predictions_df = pd.DataFrame([prediction_row])
+
+    feature_columns = list(invoice_df.columns)
+    components = create_explanation_components(
+        predictor=predictor,
+        row_index=0,
+        prediction_row=prediction_row,
+        feature_columns=feature_columns,
+        predictions_df=predictions_df,
+    )
+
+    result_markdown = _build_live_result_markdown(components.payload, warnings)
+    explanation_markdown = components.markdown
+
+    state["last_explanation_payload"] = components.payload
+    state["last_explanation_markdown"] = explanation_markdown
+    state["last_explanation_row_index"] = 0
+
+    progress(0.9, desc="Abgeschlossen")
+    return result_markdown, explanation_markdown, "", state
 def analyze_patterns_action(state: Optional[Dict[str, Any]]):
     state = state or {}
     df_features = state.get("df_features")
@@ -2968,6 +3795,7 @@ def handle_menu_action(
     synth_lines,
     synth_ratio,
     synth_seed,
+    synth_balance_checkbox=None,
     synth_debug,
     batch_file,
     rule_coverage_box,
@@ -3025,6 +3853,7 @@ def handle_menu_action(
                 "lines": synth_lines,
                 "ratio": synth_ratio,
                 "seed": synth_seed,
+                "balance_classes": synth_balance_checkbox,
                 "debug": synth_debug,
             },
             "batch_prediction": {
@@ -3213,12 +4042,22 @@ def build_interface() -> gr.Blocks:
 
                     gr.Markdown("## Feedback")
                     with gr.Row():
-                        feedback_index = gr.Number(label="Zeilenindex", value=0, precision=0)
-                        feedback_user = gr.Textbox(label="Benutzer", value="analyst")
-                        feedback_comment = gr.Textbox(label="Kommentar", placeholder="optional")
-                    with gr.Row():
-                        feedback_tp_btn = gr.Button("Maßnahme korrekt")
-                        feedback_fp_btn = gr.Button("Maßnahme falsch")
+                        feedback_index = gr.Number(label="Rechnung #", value=0, precision=0)
+                        feedback_correct_btn = gr.Button("👍 Korrekt", variant="primary")
+                        feedback_incorrect_btn = gr.Button("👎 Falsch", variant="secondary")
+                    feedback_modal = gr.Column(visible=False)
+                    with feedback_modal:
+                        feedback_modal_title = gr.Markdown("Feedback")
+                        feedback_actual_dropdown = gr.Dropdown(
+                            label="Tatsächliche Maßnahme",
+                            choices=CANONICAL_MASSNAHMEN,
+                            value=CANONICAL_MASSNAHMEN[0],
+                        )
+                        feedback_comment = gr.Textbox(label="Kommentar (optional)", lines=3)
+                        feedback_user = gr.Textbox(label="Ihr Name", value="Workshop Gast")
+                        with gr.Row():
+                            feedback_save_btn = gr.Button("Speichern", variant="primary")
+                            feedback_cancel_btn = gr.Button("Abbrechen")
                     feedback_status = gr.Textbox(label="Feedback-Status", interactive=False)
                     feedback_report_btn = gr.Button("Feedback-Report erzeugen")
                     feedback_report_status = gr.Textbox(label="Report-Status", interactive=False)
@@ -3253,6 +4092,73 @@ def build_interface() -> gr.Blocks:
                     explain_status = gr.Textbox(label="Erklärungs-Status", interactive=False)
                     rule_explanation = gr.Markdown(label="Erklärung")
                     explain_download = gr.File(label="Erklärungs-Download", interactive=False)
+
+            with gr.TabItem("Live-Demo"):
+                live_defaults = _default_live_form()
+                with gr.Column():
+                    gr.Markdown("## Neue Rechnung eingeben")
+                    scenario_dropdown = gr.Dropdown(
+                        choices=[LIVE_SCENARIO_DEFAULT] + list(LIVE_SCENARIOS.keys()),
+                        label="Beispiel-Szenario laden",
+                        value=LIVE_SCENARIO_DEFAULT,
+                    )
+
+                    with gr.Row():
+                        betrag_input = gr.Number(label="Betrag (€)", value=live_defaults["betrag"], precision=2)
+                        ampel_input = gr.Dropdown(
+                            label="Ampel",
+                            choices=["Grün (1)", "Gelb (2)", "Rot (3)"],
+                            value=live_defaults["ampel"],
+                        )
+                    with gr.Row():
+                        buk_input = gr.Textbox(label="BUK", value=live_defaults["buk"])
+                        debitor_input = gr.Textbox(label="Debitor", value=live_defaults["debitor"])
+
+                    with gr.Row():
+                        belegdatum_input = gr.Date(label="Belegdatum", value=live_defaults["belegdatum"])
+                        faelligkeit_input = gr.Date(label="Fälligkeitsdatum", value=live_defaults["faelligkeit"])
+
+                    deb_name_input = gr.Textbox(label="DEB-Name", value=live_defaults["deb_name"])
+                    hinweise_input = gr.Textbox(
+                        label="Hinweise",
+                        value=live_defaults["hinweise"],
+                        lines=3,
+                    )
+                    negativ_checkbox = gr.Checkbox(
+                        label="Historisch abgelehnt (negativ-Flag)",
+                        value=live_defaults["negativ"],
+                    )
+
+                    submit_live_btn = gr.Button("🚀 Empfehlung berechnen", variant="primary")
+
+                    live_result_status = gr.Markdown(label="Ergebnis")
+                    live_result_explanation = gr.Markdown(label="Begründung")
+
+                    with gr.Row():
+                        export_live_btn = gr.Button("📄 Erklärung exportieren")
+                        reset_live_btn = gr.Button("🔄 Neue Rechnung")
+
+                    live_export_status = gr.Textbox(label="Status", interactive=False)
+                    live_export_download = gr.File(label="Markdown-Download", interactive=False)
+
+            with gr.TabItem("Feedback & Lernen"):
+                with gr.Column():
+                    gr.Markdown("## Feedback-Dashboard")
+                    feedback_summary_md = gr.Markdown(label="Übersicht", value="Noch kein Feedback erfasst.")
+                    feedback_trend_plot = gr.LinePlot(
+                        label="Trend über Zeit",
+                        x="week",
+                        y="accuracy",
+                        overlay_point=True,
+                        tooltip=["accuracy", "feedbacks"],
+                    )
+                    feedback_per_class_df = gr.Dataframe(label="Pro Maßnahme", interactive=False)
+                    feedback_critical_md = gr.Markdown(label="Hinweise", value="Keine kritischen Maßnahmen erkannt.")
+
+                    gr.Markdown("## Retraining")
+                    retrain_btn = gr.Button("🔄 Modell nachtrainieren (Demo-Modus)")
+                    retrain_status = gr.Textbox(label="Status", interactive=False)
+                    retrain_comparison_df = gr.Dataframe(label="Vorher-Nachher-Vergleich", interactive=False)
 
             with gr.TabItem("Konfiguration"):
                 with gr.Column():
@@ -3330,6 +4236,7 @@ def build_interface() -> gr.Blocks:
                         "0 = minimale Mutationen (Original fast kopiert), 1 = starke Abweichungen (neue Texte/Beträge). Beispiel: 0.3 erzeugt leichte Textvarianten."
                     ))
                     synth_variation = gr.Slider(0.0, 1.0, value=0.35, step=0.05, show_label=False)
+                    synth_balance = gr.Checkbox(label="Klassen-Ungleichgewicht beheben", value=False)
                     with gr.Row():
                         with gr.Column():
                             gr.HTML(_tooltip_label(
@@ -3410,6 +4317,7 @@ def build_interface() -> gr.Blocks:
                 synth_gpt_model,
                 synth_gpt_key,
                 synth_gpt_enable,
+                synth_balance,
                 synth_debug,
                 state,
             ],
@@ -3460,6 +4368,12 @@ def build_interface() -> gr.Blocks:
                 rule_coverage_box,
                 ml_fallback_box,
                 massnahmen_distribution_plot,
+                feedback_summary_md,
+                feedback_trend_plot,
+                feedback_per_class_df,
+                feedback_critical_md,
+                retrain_status,
+                retrain_comparison_df,
                 state,
             ],
         )
@@ -3476,6 +4390,66 @@ def build_interface() -> gr.Blocks:
             outputs=[explain_status, explain_download, state],
         )
 
+        scenario_dropdown.change(
+            load_scenario_action,
+            inputs=[scenario_dropdown, state],
+            outputs=[
+                betrag_input,
+                ampel_input,
+                buk_input,
+                debitor_input,
+                belegdatum_input,
+                faelligkeit_input,
+                deb_name_input,
+                hinweise_input,
+                negativ_checkbox,
+            ],
+        )
+
+        submit_live_btn.click(
+            predict_live_action,
+            inputs=[
+                betrag_input,
+                ampel_input,
+                buk_input,
+                debitor_input,
+                belegdatum_input,
+                faelligkeit_input,
+                deb_name_input,
+                hinweise_input,
+                negativ_checkbox,
+                state,
+            ],
+            outputs=[live_result_status, live_result_explanation, live_export_status, state],
+        )
+
+        export_live_btn.click(
+            export_explanation_action,
+            inputs=[state],
+            outputs=[live_export_status, live_export_download, state],
+        )
+
+        reset_live_btn.click(
+            reset_live_form_action,
+            inputs=[state],
+            outputs=[
+                scenario_dropdown,
+                betrag_input,
+                ampel_input,
+                buk_input,
+                debitor_input,
+                belegdatum_input,
+                faelligkeit_input,
+                deb_name_input,
+                hinweise_input,
+                negativ_checkbox,
+                live_result_status,
+                live_result_explanation,
+                live_export_status,
+                live_export_download,
+            ],
+        )
+
         report_btn.click(
             generate_pattern_report_action,
             inputs=[state],
@@ -3488,22 +4462,64 @@ def build_interface() -> gr.Blocks:
             outputs=[pattern_status, pattern_preview, pattern_download, state],
         )
 
-        feedback_tp_btn.click(
-            feedback_tp_action,
-            inputs=[state, feedback_index, feedback_user, feedback_comment],
-            outputs=[feedback_status, state],
+        feedback_correct_btn.click(
+            partial(open_feedback_modal_action, mode="correct"),
+            inputs=[state, feedback_index],
+            outputs=[
+                feedback_modal,
+                feedback_modal_title,
+                feedback_actual_dropdown,
+                feedback_comment,
+                feedback_user,
+                feedback_status,
+                state,
+            ],
         )
 
-        feedback_fp_btn.click(
-            feedback_fp_action,
-            inputs=[state, feedback_index, feedback_user, feedback_comment],
-            outputs=[feedback_status, state],
+        feedback_incorrect_btn.click(
+            partial(open_feedback_modal_action, mode="incorrect"),
+            inputs=[state, feedback_index],
+            outputs=[
+                feedback_modal,
+                feedback_modal_title,
+                feedback_actual_dropdown,
+                feedback_comment,
+                feedback_user,
+                feedback_status,
+                state,
+            ],
+        )
+
+        feedback_cancel_btn.click(
+            cancel_feedback_modal_action,
+            inputs=[state],
+            outputs=[feedback_modal, feedback_status, state],
+        )
+
+        feedback_save_btn.click(
+            submit_feedback_action,
+            inputs=[feedback_user, feedback_actual_dropdown, feedback_comment, state],
+            outputs=[
+                feedback_modal,
+                feedback_status,
+                feedback_summary_md,
+                feedback_trend_plot,
+                feedback_per_class_df,
+                feedback_critical_md,
+                state,
+            ],
         )
 
         feedback_report_btn.click(
             feedback_report_action,
             inputs=[state],
             outputs=[feedback_report_status, feedback_report_preview, feedback_report_download, state],
+        )
+
+        retrain_btn.click(
+            retrain_with_feedback_action,
+            inputs=[state],
+            outputs=[retrain_status, retrain_comparison_df, state],
         )
 
         batch_button.click(
