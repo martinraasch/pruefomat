@@ -177,10 +177,19 @@ class HybridMassnahmenPredictor:
             class_index = max(0, min(class_index, len(shap_values) - 1))
             shap_values = shap_values[class_index]
 
-        values = shap_values[0]
+        values = np.asarray(shap_values).ravel()
+
+        if values.ndim > 1:
+            values = values[0]
+
         feature_names = list(self.feature_names_) if self.feature_names_ is not None else list(row.index)
+
+        min_len = min(len(feature_names), len(values))
+        feature_names = feature_names[:min_len]
+        values = values[:min_len]
+
         pairs = list(zip(feature_names, values))
-        pairs.sort(key=lambda item: abs(item[1]), reverse=True)
+        pairs.sort(key=lambda item: abs(float(item[1])), reverse=True)
         return pairs[:top_n]
 
     def _get_rule_conditions(self, rule_name: str, row: pd.Series) -> Optional[list[Dict[str, Any]]]:
